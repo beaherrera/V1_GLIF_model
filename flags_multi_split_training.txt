@@ -1,0 +1,23 @@
+initial_evaluation_command
+['sbatch', '-N1', '-c1', '-n4', '--gpus=a100:1', '--partition=d3', '--mem=200G', '--time=4:00:00', '--qos=d3', '-o', 'Out/b_qsdb_65871_initial_test.out', '-e', 'Error/b_qsdb_65871_initial_test.err', '-J', 'b_qsdb_initial_test', '--wrap', 'python -u osi_dsi_estimator.py --task_name drifting_gratings_firing_rates_distr --dat..._results/v1_65871/b_qsdb  --run_session -1']
+special variables:
+function variables:
+00: 'sbatch'
+01: '-N1'
+02: '-c1'
+03: '-n4'
+04: '--gpus=a100:1'
+05: '--partition=d3'
+06: '--mem=200G'
+07: '--time=4:00:00'
+08: '--qos=d3'
+09: '-o'
+10: 'Out/b_qsdb_65871_initial_test.out'
+11: '-e'
+12: 'Error/b_qsdb_65871_initial_test.err'
+13: '-J'
+14: 'b_qsdb_initial_test'
+15: '--wrap'
+16: "python -u osi_dsi_estimator.py --task_name drifting_gratings_firing_rates_distr --data_dir GLIF_network --results_dir Simulation_results --restore_from  --comment  --delays 0,0 --scale 2,2 --dtype float32 --optimizer adam --learning_rate 0.001 --rate_cost 10000.0 --voltage_cost 1.0 --sync_cost 0.3 --osi_cost 10.0 --osi_loss_subtraction_ratio 0.0 --osi_loss_method 'crowd_osi' --dampening_factor 0.1 --recurrent_dampening_factor 0.1 --input_weight_scale 1.0 --gauss_std 0.3 --recurrent_weight_regularization 1.0 --lr_scale 1.0 --temporal_f 2.0 --max_time -1 --loss_core_radius 200.0 --plot_core_radius 200.0 --n_runs 20 --n_epochs 50 --batch_size 1 --neurons 65871 --steps_per_epoch 25 --val_steps 1 --n_input 17400 --seq_len 500 --cue_duration 40 --neurons_per_output 16 --caching --nocore_only --nocore_loss --nohard_reset --train_recurrent --notrain_recurrent_per_type --notrain_input --train_noise --connected_selection --noneuron_output --nopseudo_gauss --bmtk_compat_lgn --noreset_every_step --nospontaneous_training --norandom_weights --rotation ccw --seed 3000 --ckpt_dir Simulation_results/v1_65871/b_qsdb  --run_session -1"
+len(): 17
+

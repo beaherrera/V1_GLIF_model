@@ -41,3 +41,5 @@ synaptic_data/basis_function_weights_5.csv
 synaptic_data/tau_basis_5.npy
 .gitignore
 synaptic_data/double_alpha_params_full.csv
+V1_tuning_angle_variation.png
+parallel_training_testing_workstation.py

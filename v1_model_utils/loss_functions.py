@@ -6,6 +6,7 @@ import pickle as pkl
 from math import pi
 import os
 import sys
+
 sys.path.append(os.path.join(os.getcwd(), "v1_model_utils"))
 import other_v1_utils
 
@@ -18,7 +19,7 @@ import other_v1_utils
 
 #     def __call__(self, x):
 #         return self._strength * tf.reduce_mean(tf.square(x - self._initial_value))
-    
+
 # class L2Regularizer(tf.keras.regularizers.Regularizer):
 #     def __init__(self, strength, initial_value):
 #         super().__init__()
@@ -28,24 +29,31 @@ import other_v1_utils
 #     def __call__(self, x):
 #         return self._strength * tf.reduce_mean(tf.square(x))
 
+
 class StiffRegularizer(Layer):
-    def __init__(self, strength, network, penalize_relative_change=False, dtype=tf.float32):
+    def __init__(
+        self, strength, network, penalize_relative_change=False, dtype=tf.float32
+    ):
         self._strength = tf.cast(strength, dtype)
         self._dtype = dtype
         self._penalize_relative_change = penalize_relative_change
         # Compute voltage scale
-        voltage_scale = (network['node_params']['V_th'] - network['node_params']['E_L']).astype(np.float32)
+        voltage_scale = (
+            network["node_params"]["V_th"] - network["node_params"]["E_L"]
+        ).astype(np.float32)
         # Get the initial weights and properly scale them down
         indices = network["synapses"]["indices"]
         initial_value = np.array(network["synapses"]["weights"], dtype=np.float32)
-        edge_type_ids = network['synapses']['edge_type_ids']
+        edge_type_ids = network["synapses"]["edge_type_ids"]
         # Scale initial values by the voltage scale of the node IDs
-        initial_value /= voltage_scale[network['node_type_ids'][indices[:, 0]]]
+        initial_value /= voltage_scale[network["node_type_ids"][indices[:, 0]]]
         # Find unique values and their first occurrence indices
         unique_edge_types, self.idx = np.unique(edge_type_ids, return_inverse=True)
         # Sort first_occurrence_indices to maintain the order of first appearances
         self.num_unique = unique_edge_types.shape[0]
-        sum_weights = np.bincount(self.idx, weights=initial_value, minlength=self.num_unique)
+        sum_weights = np.bincount(
+            self.idx, weights=initial_value, minlength=self.num_unique
+        )
         count_weights = np.bincount(self.idx, minlength=self.num_unique)
         initial_mean_weights = sum_weights / count_weights
         # Determine target mean weights
@@ -64,53 +72,80 @@ class StiffRegularizer(Layer):
         if len(x.shape) > 1 and x.shape[1] == 1:
             x = tf.squeeze(x, axis=1)
 
-        mean_edge_type_weights = tf.math.unsorted_segment_mean(x, self.idx, self.num_unique)
+        mean_edge_type_weights = tf.math.unsorted_segment_mean(
+            x, self.idx, self.num_unique
+        )
         if self._penalize_relative_change:
             # return self._strength * tf.reduce_mean(tf.abs(x - self._initial_value))
-            relative_deviation = (mean_edge_type_weights - self._target_mean_weights) / self._denominator
+            relative_deviation = (
+                mean_edge_type_weights - self._target_mean_weights
+            ) / self._denominator
             # Penalize the relative deviation
             reg_loss = tf.sqrt(tf.reduce_mean(tf.square(relative_deviation)))
         else:
-            reg_loss = tf.reduce_mean(tf.square(mean_edge_type_weights - self._target_mean_weights))
-        
+            reg_loss = tf.reduce_mean(
+                tf.square(mean_edge_type_weights - self._target_mean_weights)
+            )
+
         return tf.cast(reg_loss, dtype=self._dtype) * self._strength
-    
+
 
 class L2Regularizer(tf.keras.regularizers.Regularizer):
-    def __init__(self, strength, network, flags, penalize_relative_change=False, dtype=tf.float32):
+    def __init__(
+        self, strength, network, flags, penalize_relative_change=False, dtype=tf.float32
+    ):
         super().__init__()
         self._strength = tf.cast(strength, dtype)
         self._dtype = dtype
 
         if penalize_relative_change:
             # Compute voltage scale
-            voltage_scale = (network['node_params']['V_th'] - network['node_params']['E_L']).astype(np.float32)
+            voltage_scale = (
+                network["node_params"]["V_th"] - network["node_params"]["E_L"]
+            ).astype(np.float32)
             # Get the initial weights and properly scale them down
             indices = network["synapses"]["indices"]
             weights = np.array(network["synapses"]["weights"], dtype=np.float32)
             # Scale initial values by the voltage scale of the node IDs
-            voltage_scale_node_ids = voltage_scale[network['node_type_ids'][indices[:, 0]]]
+            voltage_scale_node_ids = voltage_scale[
+                network["node_type_ids"][indices[:, 0]]
+            ]
             initial_value = weights / voltage_scale_node_ids
             # using the edge_type ids group calculate the mean weight of each type of edge in the network and then create a constant with same shape as weights and with each value corresponding to the populations mean
             # Calculate mean weights for each edge type
-            edge_type_ids = np.array(network['synapses']['edge_type_ids'])
-            unique_edge_type_ids, inverse_indices = np.unique(edge_type_ids, return_inverse=True)
-            mean_weights = np.array([np.mean(initial_value[edge_type_ids == edge_type_id]) for edge_type_id in unique_edge_type_ids])
+            edge_type_ids = np.array(network["synapses"]["edge_type_ids"])
+            unique_edge_type_ids, inverse_indices = np.unique(
+                edge_type_ids, return_inverse=True
+            )
+            mean_weights = np.array(
+                [
+                    np.mean(initial_value[edge_type_ids == edge_type_id])
+                    for edge_type_id in unique_edge_type_ids
+                ]
+            )
             # Create target mean weights array based on the edge type indices
-            self._target_mean_weights = tf.constant(mean_weights[inverse_indices], dtype=tf.float32)
-            epsilon = tf.constant(1e-4, dtype=tf.float32)  # A small constant to avoid division by zero
-            self._target_mean_weights = tf.maximum(tf.abs(self._target_mean_weights), epsilon)
+            self._target_mean_weights = tf.constant(
+                mean_weights[inverse_indices], dtype=tf.float32
+            )
+            epsilon = tf.constant(
+                1e-4, dtype=tf.float32
+            )  # A small constant to avoid division by zero
+            self._target_mean_weights = tf.maximum(
+                tf.abs(self._target_mean_weights), epsilon
+            )
         else:
             self._target_mean_weights = None
 
     @tf.function(jit_compile=True)
     def __call__(self, x):
-        
+
         if len(x.shape) > 1 and x.shape[1] == 1:
             x = tf.squeeze(x, axis=1)
 
         if self._target_mean_weights is None:
-            return tf.cast(self._strength * tf.reduce_mean(tf.square(x)), dtype=self._dtype)
+            return tf.cast(
+                self._strength * tf.reduce_mean(tf.square(x)), dtype=self._dtype
+            )
         else:
             relative_deviation = x / self._target_mean_weights
             mse = self._strength * tf.reduce_mean(tf.square(relative_deviation))
@@ -126,6 +161,7 @@ def spike_trimming(spikes, pre_delay=50, post_delay=50, trim=True):
         spikes = spikes[:, pre:, :]
     return spikes
 
+
 def sample_firing_rates(firing_rates, n_neurons, rnd_seed):
     # Sort the original firing rates
     sorted_firing_rates = np.sort(firing_rates)
@@ -136,8 +172,9 @@ def sample_firing_rates(firing_rates, n_neurons, rnd_seed):
     x_rand = rate_rd.uniform(low=0, high=1, size=n_neurons)
     # Use inverse transform sampling: interpolate the uniform values to find the firing rates
     target_firing_rates = np.sort(np.interp(x_rand, percentiles, sorted_firing_rates))
-    # target_firing_rates = np.interp(x_rand, percentiles, sorted_firing_rates)    
+    # target_firing_rates = np.interp(x_rand, percentiles, sorted_firing_rates)
     return target_firing_rates
+
 
 def huber_quantile_loss(u, tau, kappa, dtype=tf.float32):
     tau = tf.cast(tau, dtype)
@@ -146,6 +183,7 @@ def huber_quantile_loss(u, tau, kappa, dtype=tf.float32):
     branch_1 = num / (2 * kappa) * tf.square(u)
     branch_2 = num * (abs_u - 0.5 * kappa)
     return tf.where(abs_u <= kappa, branch_1, branch_2)
+
 
 ### To calculate the loss of firing rates between neuron types
 def compute_spike_rate_target_loss(rates, target_rates, dtype=tf.float32):
@@ -173,13 +211,16 @@ def compute_spike_rate_target_loss(rates, target_rates, dtype=tf.float32):
             #     _rate_type = tf.gather(rates, value["neuron_ids"])
             #     target_rate = value["sorted_target_rates"]
 
-            loss_type = compute_spike_rate_distribution_loss(_rate_type, target_rate, dtype=dtype)
+            loss_type = compute_spike_rate_distribution_loss(
+                _rate_type, target_rate, dtype=dtype
+            )
             total_loss += tf.reduce_sum(loss_type)
             num_neurons += tf.size(neuron_ids)
-        
-    total_loss /= tf.cast(num_neurons, dtype=dtype)  
+
+    total_loss /= tf.cast(num_neurons, dtype=dtype)
 
     return total_loss
+
 
 def compute_spike_rate_distribution_loss(_rates, target_rate, dtype=tf.float32):
     # Firstly we shuffle the current model rates to avoid bias towards a particular tuning angles (inherited from neurons ordering in the network)
@@ -196,47 +237,72 @@ def compute_spike_rate_distribution_loss(_rates, target_rate, dtype=tf.float32):
 
     return loss
 
-def process_neuropixels_data(path=''):
+
+def process_neuropixels_data(path=""):
     # Load data
-    neuropixels_data_path = f'Neuropixels_data/cortical_metrics_1.4.csv'
+    neuropixels_data_path = f"Neuropixels_data/cortical_metrics_1.4.csv"
     df_all = pd.read_csv(neuropixels_data_path, sep=",")
     # Exc and PV have sufficient number of cells, so we'll filter out non-V1 Exc and PV.
     # SST and VIP are small populations, so let's keep also non-V1 neurons
-    exclude = (df_all["cell_type"].isnull() | df_all["cell_type"].str.contains("EXC") | df_all["cell_type"].str.contains("PV")) \
-            & (df_all["ecephys_structure_acronym"] != 'VISp')
+    exclude = (
+        df_all["cell_type"].isnull()
+        | df_all["cell_type"].str.contains("EXC")
+        | df_all["cell_type"].str.contains("PV")
+    ) & (df_all["ecephys_structure_acronym"] != "VISp")
     df = df_all[~exclude]
     print(f"Original: {df_all.shape[0]} cells,   filtered: {df.shape[0]} cells")
+
+    df_SstTac1 = df[df.cell_type.isin(["PV_L4", "PV_L23"])].copy(deep=True)
+    df_SstTac1.reset_index(drop=True, inplace=True)
+    df_SstTac1["cell_type"] = df_SstTac1["cell_type"].str.replace(
+        "PV_", "SSTTac1_", regex=False
+    )
+
+    df = pd.concat([df, df_SstTac1], ignore_index=True)
 
     # Some cells have very large values of RF. They are likely not-good fits, so ignore.
     df.loc[(df["width_rf"] > 100), "width_rf"] = np.nan
     df.loc[(df["height_rf"] > 100), "height_rf"] = np.nan
 
     # Save the processed table
-    df.to_csv(f'Neuropixels_data/v1_OSI_DSI_DF.csv', sep=" ", index=False)
+    df.to_csv(f"Neuropixels_data/v1_OSI_DSI_DF.csv", sep=" ", index=False)
     # return df
+
 
 def neuropixels_cell_type_to_cell_type(pop_name):
     # Convert pop_name in the neuropixels cell type to cell types. E.g, 'EXC_L23' -> 'L2/3 Exc', 'PV_L5' -> 'L5 PV'
-    layer = pop_name.split('_')[1]
-    class_name = pop_name.split('_')[0]
+    layer = pop_name.split("_")[1]
+    class_name = pop_name.split("_")[0]
     if "2" in layer:
         layer = "L2/3"
     elif layer == "L1":
         return "L1 Htr3a"  # special case
     if class_name == "EXC":
         class_name = "Exc"
-    if class_name == 'Htr3a':
-        class_name = 'VIP'
+    if class_name == "Htr3a":
+        class_name = "VIP"
 
     return f"{layer} {class_name}"
 
 
 class SpikeRateDistributionTarget:
-    """ Instead of regularization, treat it as a target.
-        The main difference is that this class will calculate the loss
-        for each subtypes of the neurons."""
-    def __init__(self, network, spontaneous_fr=False, rate_cost=.5, pre_delay=None, post_delay=None, 
-                 data_dir='GLIF_network', core_mask=None, rates_dampening=1.0, seed=42, dtype=tf.float32):
+    """Instead of regularization, treat it as a target.
+    The main difference is that this class will calculate the loss
+    for each subtypes of the neurons."""
+
+    def __init__(
+        self,
+        network,
+        spontaneous_fr=False,
+        rate_cost=0.5,
+        pre_delay=None,
+        post_delay=None,
+        data_dir="GLIF_network",
+        core_mask=None,
+        rates_dampening=1.0,
+        seed=42,
+        dtype=tf.float32,
+    ):
         self._network = network
         self._rate_cost = rate_cost
         self._pre_delay = pre_delay
@@ -249,9 +315,9 @@ class SpikeRateDistributionTarget:
         self._dtype = dtype
         self._seed = seed
         if spontaneous_fr:
-            self.neuropixels_feature = 'firing_rate_sp'
+            self.neuropixels_feature = "firing_rate_sp"
         else:
-            self.neuropixels_feature = 'Ave_Rate(Hz)'
+            self.neuropixels_feature = "Ave_Rate(Hz)"
         self._target_rates = self.get_neuropixels_firing_rates()
 
     def get_neuropixels_firing_rates(self):
@@ -262,61 +328,94 @@ class SpikeRateDistributionTarget:
             dict: Dictionary containing rates and node_type_ids for each population query.
         """
         # Load data
-        neuropixels_data_path = f'Neuropixels_data/v1_OSI_DSI_DF.csv'
+        neuropixels_data_path = f"Neuropixels_data/v1_OSI_DSI_DF.csv"
         if not os.path.exists(neuropixels_data_path):
             process_neuropixels_data(path=neuropixels_data_path)
 
-        features_to_load = ['ecephys_unit_id', 'cell_type', 'firing_rate_sp', 'Ave_Rate(Hz)']
-        np_df = pd.read_csv(neuropixels_data_path, index_col=0, sep=" ", usecols=features_to_load).dropna(how='all')
-        area_node_types = pd.read_csv(os.path.join(self._data_dir, f'network/v1_node_types.csv'), sep=" ")
+        features_to_load = [
+            "ecephys_unit_id",
+            "cell_type",
+            "firing_rate_sp",
+            "Ave_Rate(Hz)",
+        ]
+        np_df = pd.read_csv(
+            neuropixels_data_path, index_col=0, sep=" ", usecols=features_to_load
+        ).dropna(how="all")
+        area_node_types = pd.read_csv(
+            os.path.join(self._data_dir, f"network/v1_node_types.csv"), sep=" "
+        )
 
         # Define population queries
         query_mapping = {
-            "i1H": 'ALL_L1',
-            "e23": 'EXC_L23',
-            "i23P": 'PV_L23',
-            "i23S": 'SST_L23',
-            "i23V": 'VIP_L23',
-            "e4": 'EXC_L4',
-            "i4P": 'PV_L4',
-            "i4S": 'SST_L4',
-            "i4V": 'VIP_L4',
-            "e5": 'EXC_L5',
-            "i5P": 'PV_L5',
-            "i5S": 'SST_L5',
-            "i5V": 'VIP_L5',
-            "e6": 'EXC_L6',
-            "i6P": 'PV_L6',
-            "i6S": 'SST_L6',
-            "i6V": 'VIP_L6'
+            "i1H": "ALL_L1",
+            "e23": "EXC_L23",
+            "i23P": "PV_L23",
+            "i23Sst": "SST_L23",
+            "i23SstTac1": "SSTTac1_L23",
+            "i23V": "VIP_L23",
+            "e4": "EXC_L4",
+            "i4P": "PV_L4",
+            "i4Sst": "SST_L4",
+            "i4SstTac1": "SSTTac1_L4",
+            "i4V": "VIP_L4",
+            "e5": "EXC_L5",
+            "i5P": "PV_L5",
+            "i5S": "SST_L5",
+            "i5V": "VIP_L5",
+            "e6": "EXC_L6",
+            "i6P": "PV_L6",
+            "i6S": "SST_L6",
+            "i6V": "VIP_L6",
         }
 
         # Define the reverse mapping
-        reversed_query_mapping = {v:k for k, v in query_mapping.items()}
+        reversed_query_mapping = {v: k for k, v in query_mapping.items()}
         # Process rates
         type_rates_dict = {
-                            reversed_query_mapping[cell_type]: np.append(subdf[self.neuropixels_feature].dropna().values / 1000, 0)
-                            # reversed_query_mapping[cell_type]: np.sort(np.append(subdf[self.neuropixels_feature].dropna().values / 1000, 0)) # the rates are sorted again later so is redundant
-                            for cell_type, subdf in np_df.groupby("cell_type")
-                        }
+            reversed_query_mapping[cell_type]: np.append(
+                subdf[self.neuropixels_feature].dropna().values / 1000, 0
+            )
+            # reversed_query_mapping[cell_type]: np.sort(np.append(subdf[self.neuropixels_feature].dropna().values / 1000, 0)) # the rates are sorted again later so is redundant
+            for cell_type, subdf in np_df.groupby("cell_type")
+        }
         # Identify node_type_ids for each population query
-        pop_ids = {query: area_node_types[area_node_types.pop_name.str.contains(query)].index.values for query in query_mapping.keys()}
+        pop_ids = {
+            query: area_node_types[
+                (
+                    area_node_types.pop_name.str.endswith(query)
+                    if query.startswith("i23Sst") or query.startswith("i4Sst")
+                    else area_node_types.pop_name.str.startswith(query)
+                )
+            ].index.values
+            for query in query_mapping.keys()
+        }
         # Create a dictionary with rates and IDs
-        target_firing_rates = {pop_query: {'rates': type_rates_dict[pop_query], 'ids': pop_ids[pop_query]} for pop_query in pop_ids.keys()}
-        
+        target_firing_rates = {
+            pop_query: {"rates": type_rates_dict[pop_query], "ids": pop_ids[pop_query]}
+            for pop_query in pop_ids.keys()
+        }
+
         for key, value in target_firing_rates.items():
             # identify tne ids that are included in value["ids"]
-            neuron_ids = np.where(np.isin(self._network["node_type_ids"], value["ids"]))[0]
+            neuron_ids = np.where(
+                np.isin(self._network["node_type_ids"], value["ids"])
+            )[0]
             if self._core_mask is not None:
                 # if core_mask is not None, use only neurons in the core
                 neuron_ids = neuron_ids[self._np_core_mask[neuron_ids]]
 
             type_n_neurons = len(neuron_ids)
-            target_firing_rates[key]['neuron_ids'] = tf.convert_to_tensor(neuron_ids, dtype=tf.int32)
-            sorted_target_rates = self._rates_dampening * sample_firing_rates(value["rates"], type_n_neurons, self._seed)
-            target_firing_rates[key]['sorted_target_rates'] = tf.convert_to_tensor(sorted_target_rates, dtype=self._dtype)
+            target_firing_rates[key]["neuron_ids"] = tf.convert_to_tensor(
+                neuron_ids, dtype=tf.int32
+            )
+            sorted_target_rates = self._rates_dampening * sample_firing_rates(
+                value["rates"], type_n_neurons, self._seed
+            )
+            target_firing_rates[key]["sorted_target_rates"] = tf.convert_to_tensor(
+                sorted_target_rates, dtype=self._dtype
+            )
 
-        return target_firing_rates    
+        return target_firing_rates
 
     def __call__(self, spikes, trim=True):
         # if trim:
@@ -325,12 +424,19 @@ class SpikeRateDistributionTarget:
         #     if self._post_delay is not None and self._post_delay != 0:
         #         spikes = spikes[:, :-self._post_delay, :]
 
-        spikes = spike_trimming(spikes, pre_delay=self._pre_delay, post_delay=self._post_delay, trim=trim)
-        rates = tf.reduce_mean(spikes, (0, 1)) # calculate the mean firing rate over time and batch
+        spikes = spike_trimming(
+            spikes, pre_delay=self._pre_delay, post_delay=self._post_delay, trim=trim
+        )
+        rates = tf.reduce_mean(
+            spikes, (0, 1)
+        )  # calculate the mean firing rate over time and batch
 
-        reg_loss = compute_spike_rate_target_loss(rates, self._target_rates, dtype=self._dtype) 
+        reg_loss = compute_spike_rate_target_loss(
+            rates, self._target_rates, dtype=self._dtype
+        )
 
         return reg_loss * self._rate_cost
+
 
 # class SpikeRateDistributionRegularization:
 #     def __init__(self, target_rates, rate_cost=0.5, dtype=tf.float32):
@@ -347,9 +453,22 @@ class SpikeRateDistributionTarget:
 
 #         return reg_loss
 
+
 class SynchronizationLoss(Layer):
-    def __init__(self, network, sync_cost=10., t_start=0., t_end=0.5, n_samples=50, data_dir='Synchronization_data', 
-                 session='evoked', dtype=tf.float32, core_mask=None, seed=42, **kwargs):
+    def __init__(
+        self,
+        network,
+        sync_cost=10.0,
+        t_start=0.0,
+        t_end=0.5,
+        n_samples=50,
+        data_dir="Synchronization_data",
+        session="evoked",
+        dtype=tf.float32,
+        core_mask=None,
+        seed=42,
+        **kwargs,
+    ):
         super(SynchronizationLoss, self).__init__(dtype=dtype, **kwargs)
         self._sync_cost = sync_cost
         self._t_start = t_start
@@ -368,21 +487,27 @@ class SynchronizationLoss(Layer):
         node_ei = np.array([pop_name[0] for pop_name in pop_names])
         node_id = np.arange(len(node_ei))
         # Get the IDs for excitatory neurons
-        node_id_e = node_id[node_ei == 'e']
-        self.node_id_e = tf.constant(node_id_e, dtype=tf.int32) # 14423
+        node_id_e = node_id[node_ei == "e"]
+        self.node_id_e = tf.constant(node_id_e, dtype=tf.int32)  # 14423
         # Pre-define bin sizes (same as experimental data)
         bin_sizes = np.logspace(-3, 0, 20)
         # using the simulation length, limit bin_sizes to define at least 2 bins
-        bin_sizes_mask = bin_sizes < (self._t_end - self._t_start)/2
+        bin_sizes_mask = bin_sizes < (self._t_end - self._t_start) / 2
         self.bin_sizes = bin_sizes[bin_sizes_mask]
         self.epsilon = 1e-7  # Small constant to avoid division by zero
 
         # Load the experimental data
         # experimental_data_path = os.path.join(data_dir, f'all_fano_300ms_{session}.npy')
-        experimental_data_path = os.path.join(data_dir, f'Fano_factor_v1', f'v1_fano_running_300ms_{session}.npy')
+        experimental_data_path = os.path.join(
+            data_dir, f"Fano_factor_v1", f"v1_fano_running_300ms_{session}.npy"
+        )
         experimental_fanos = np.load(experimental_data_path, allow_pickle=True)
-        experimental_fanos_mean = np.nanmean(experimental_fanos[:, bin_sizes_mask], axis=0)
-        self.experimental_fanos_mean = tf.constant(experimental_fanos_mean, dtype=self._dtype)
+        experimental_fanos_mean = np.nanmean(
+            experimental_fanos[:, bin_sizes_mask], axis=0
+        )
+        self.experimental_fanos_mean = tf.constant(
+            experimental_fanos_mean, dtype=self._dtype
+        )
 
     def pop_fano_tf(self, spikes, bin_sizes):
         spikes = tf.expand_dims(spikes, axis=-1)
@@ -404,42 +529,57 @@ class SynchronizationLoss(Layer):
 
         return fanos.stack()
 
-
     def __call__(self, spikes, trim=True):
 
         if self._core_mask is not None:
             spikes = tf.boolean_mask(spikes, self._core_mask, axis=2)
 
         if trim:
-            spikes = spikes[:, self._t_start_seconds:self._t_end_seconds, :]
+            spikes = spikes[:, self._t_start_seconds : self._t_end_seconds, :]
             bin_sizes = self.bin_sizes
             experimental_fanos_mean = self.experimental_fanos_mean
         else:
             t_start = 0
             t_end = spikes.shape[1] / 1000
             # using the simulation length, limit bin_sizes to define at least 2 bins
-            bin_sizes_mask = self.bin_sizes < (t_end - t_start)/2
+            bin_sizes_mask = self.bin_sizes < (t_end - t_start) / 2
             bin_sizes = self.bin_sizes[bin_sizes_mask]
             experimental_fanos_mean = self.experimental_fanos_mean[bin_sizes_mask]
-        
-        spikes = tf.cast(spikes, self._dtype)  
+
+        spikes = tf.cast(spikes, self._dtype)
         # choose random trials to sample from (usually we only have 1 trial to sample from)
         n_trials = tf.shape(spikes)[0]
         # increase the base seed to avoid the same random neurons to be selected in every instantiation of the class
         self._base_seed += 1
-        sample_trials = tf.random.uniform([self._n_samples], minval=0, maxval=n_trials, dtype=tf.int32, seed=self._base_seed)
+        sample_trials = tf.random.uniform(
+            [self._n_samples],
+            minval=0,
+            maxval=n_trials,
+            dtype=tf.int32,
+            seed=self._base_seed,
+        )
         # Generate sample counts with a normal distribution
         sample_size = 70
         sample_std = 30
-        sample_counts = tf.cast(tf.random.normal([self._n_samples], mean=sample_size, stddev=sample_std, seed=self._base_seed), tf.int32)
-        sample_counts = tf.clip_by_value(sample_counts, clip_value_min=15, clip_value_max=tf.shape(self.node_id_e)[0]) # clip the values to be between 15 and 14423
+        sample_counts = tf.cast(
+            tf.random.normal(
+                [self._n_samples],
+                mean=sample_size,
+                stddev=sample_std,
+                seed=self._base_seed,
+            ),
+            tf.int32,
+        )
+        sample_counts = tf.clip_by_value(
+            sample_counts, clip_value_min=15, clip_value_max=tf.shape(self.node_id_e)[0]
+        )  # clip the values to be between 15 and 14423
         # Randomize the neuron ids
         shuffled_e_ids = tf.random.shuffle(self.node_id_e, seed=self._base_seed)
         selected_spikes_sample = tf.TensorArray(self._dtype, size=self._n_samples)
         previous_id = tf.constant(0, dtype=tf.int32)
         for i in tf.range(self._n_samples):
-            sample_num = sample_counts[i] # 40 #68
-            sample_trial = sample_trials[i] # 0
+            sample_num = sample_counts[i]  # 40 #68
+            sample_trial = sample_trials[i]  # 0
             ## randomly choose sample_num ids from self.node_id_e with replacement
             ## sample_ids = tf.random.shuffle(self.node_id_e)[:sample_num]
             ## randomly choose sample_num ids from shuffled_ids without replacement
@@ -447,10 +587,12 @@ class SynchronizationLoss(Layer):
                 # shuffled_e_ids = tf.random.shuffle(self.node_id_e, seed=self._base_seed)
                 shuffled_e_ids = tf.random.shuffle(shuffled_e_ids, seed=self._base_seed)
                 previous_id = tf.constant(0, dtype=tf.int32)
-            sample_ids = shuffled_e_ids[previous_id:previous_id+sample_num]
+            sample_ids = shuffled_e_ids[previous_id : previous_id + sample_num]
             previous_id += sample_num
-            
-            selected_spikes = tf.reduce_sum(tf.gather(spikes[sample_trial], sample_ids, axis=1), axis=-1)
+
+            selected_spikes = tf.reduce_sum(
+                tf.gather(spikes[sample_trial], sample_ids, axis=1), axis=-1
+            )
             selected_spikes_sample = selected_spikes_sample.write(i, selected_spikes)
 
         selected_spikes_sample = selected_spikes_sample.stack()
@@ -461,7 +603,7 @@ class SynchronizationLoss(Layer):
         sync_loss = self._sync_cost * mse_loss
 
         return sync_loss
-   
+
 
 class VoltageRegularization:
     def __init__(self, cell, voltage_cost=1e-5, dtype=tf.float32, core_mask=None):
@@ -478,7 +620,7 @@ class VoltageRegularization:
     def __call__(self, voltages):
         if self._core_mask is not None:
             voltages = tf.boolean_mask(voltages, self._core_mask, axis=2)
-            
+
         voltages = (voltages - self._voltage_offset) / self._voltage_scale
         # v_pos = tf.square(tf.nn.relu(voltages - 1.0))
         # v_neg = tf.square(tf.nn.relu(-voltages + 1.0))
@@ -497,9 +639,19 @@ class CustomMeanLayer(Layer):
 
 
 class OrientationSelectivityLoss:
-    def __init__(self, network=None, osi_cost=1e-5, pre_delay=None, post_delay=None, dtype=tf.float32, 
-                 core_mask=None, method="crowd_osi", subtraction_ratio=1.0, layer_info=None):
-        
+    def __init__(
+        self,
+        network=None,
+        osi_cost=1e-5,
+        pre_delay=None,
+        post_delay=None,
+        dtype=tf.float32,
+        core_mask=None,
+        method="crowd_osi",
+        subtraction_ratio=1.0,
+        layer_info=None,
+    ):
+
         self._network = network
         self._osi_cost = osi_cost
         self._pre_delay = pre_delay
@@ -509,18 +661,20 @@ class OrientationSelectivityLoss:
         self._method = method
         self._subtraction_ratio = subtraction_ratio  # only for crowd_spikes method
         self._tf_pi = tf.constant(np.pi, dtype=dtype)
-        if (self._core_mask is not None) and (self._method == "crowd_spikes" or self._method == "crowd_osi"):
+        if (self._core_mask is not None) and (
+            self._method == "crowd_spikes" or self._method == "crowd_osi"
+        ):
             self.np_core_mask = self._core_mask.numpy()
-            core_tuning_angles = network['tuning_angle'][self.np_core_mask]
+            core_tuning_angles = network["tuning_angle"][self.np_core_mask]
             self._tuning_angles = tf.constant(core_tuning_angles, dtype=dtype)
         else:
-            self._tuning_angles = tf.constant(network['tuning_angle'], dtype=dtype)
-        
+            self._tuning_angles = tf.constant(network["tuning_angle"], dtype=dtype)
+
         if self._method == "neuropixels_fr":
             self._layer_info = layer_info  # needed for neuropixels_fr method
             # the layer_info should be a dictionary that contains
             # the cell id of the corresponding layer.
-            # the keys should be something like "EXC_L23" or "PV_L5"   
+            # the keys should be something like "EXC_L23" or "PV_L5"
 
         elif self._method == "crowd_osi":
             # Get the target OSI
@@ -534,9 +688,9 @@ class OrientationSelectivityLoss:
             dsi_target_values = []
             cell_type_count = []
             for node_type_id, (key, value) in enumerate(self._target_osi_dsi.items()):
-                node_ids = value['ids']
-                osi_target_values.append(value['OSI'])
-                dsi_target_values.append(value['DSI'])
+                node_ids = value["ids"]
+                osi_target_values.append(value["OSI"])
+                dsi_target_values.append(value["DSI"])
                 cell_type_count.append(len(node_ids))
                 # update the ndoe_type_ids tensor in positions node_ids with the node_type_id
                 # self.node_type_ids = tf.tensor_scatter_nd_update(self.node_type_ids, indices=tf.expand_dims(node_ids, axis=1), updates=tf.fill(tf.shape(node_ids), node_type_id))
@@ -566,7 +720,7 @@ class OrientationSelectivityLoss:
         delta_angle = tf.where(delta_angle < -90, delta_angle + 180, delta_angle)
 
         return delta_angle
-    
+
     def get_neuropixels_osi_dsi(self):
         """
         Processes neuropixels data to obtain neurons average firing rates.
@@ -575,65 +729,89 @@ class OrientationSelectivityLoss:
             dict: Dictionary containing rates and node_type_ids for each population query.
         """
         # Load data
-        neuropixels_data_path = f'Neuropixels_data/v1_OSI_DSI_DF.csv'
+        neuropixels_data_path = f"Neuropixels_data/v1_OSI_DSI_DF.csv"
         if not os.path.exists(neuropixels_data_path):
             process_neuropixels_data(path=neuropixels_data_path)
-        features_to_load = ['ecephys_unit_id', 'cell_type', 'OSI', 'DSI', "Ave_Rate(Hz)", "max_mean_rate(Hz)"]
-        osi_dsi_df = pd.read_csv(neuropixels_data_path, index_col=0, sep=" ", usecols=features_to_load).dropna(how='all')
-        
+        features_to_load = [
+            "ecephys_unit_id",
+            "cell_type",
+            "OSI",
+            "DSI",
+            "Ave_Rate(Hz)",
+            "max_mean_rate(Hz)",
+        ]
+        osi_dsi_df = pd.read_csv(
+            neuropixels_data_path, index_col=0, sep=" ", usecols=features_to_load
+        ).dropna(how="all")
+
         nonresponding = osi_dsi_df["max_mean_rate(Hz)"] < 0.5
         osi_dsi_df.loc[nonresponding, "OSI"] = np.nan
         osi_dsi_df.loc[nonresponding, "DSI"] = np.nan
         osi_dsi_df = osi_dsi_df[osi_dsi_df["Ave_Rate(Hz)"] != 0]
         osi_dsi_df.dropna(inplace=True)
-        osi_dsi_df["cell_type"] = osi_dsi_df["cell_type"].apply(neuropixels_cell_type_to_cell_type)
-        osi_target = osi_dsi_df.groupby("cell_type")['OSI'].mean()
-        dsi_target = osi_dsi_df.groupby("cell_type")['DSI'].mean()
+        osi_dsi_df["cell_type"] = osi_dsi_df["cell_type"].apply(
+            neuropixels_cell_type_to_cell_type
+        )
+        osi_target = osi_dsi_df.groupby("cell_type")["OSI"].mean()
+        dsi_target = osi_dsi_df.groupby("cell_type")["DSI"].mean()
 
         original_pop_names = other_v1_utils.pop_names(self._network)
         if self._core_mask is not None:
-            original_pop_names = original_pop_names[self.np_core_mask] 
+            original_pop_names = original_pop_names[self.np_core_mask]
 
-        cell_types = np.array([other_v1_utils.pop_name_to_cell_type(pop_name, ignore_l5e_subtypes=True) for pop_name in original_pop_names])
+        cell_types = np.array(
+            [
+                other_v1_utils.pop_name_to_cell_type(pop_name, ignore_l5e_subtypes=True)
+                for pop_name in original_pop_names
+            ]
+        )
         node_ids = np.arange(len(cell_types))
-        cell_ids = {key: node_ids[cell_types == key] for key in set(osi_dsi_df['cell_type'])}
+        cell_ids = {
+            key: node_ids[cell_types == key] for key in set(osi_dsi_df["cell_type"])
+        }
 
         # osi_target = osi_df.groupby("cell_type")['OSI'].mean()
         # osi_target = osi_df.groupby("cell_type")['OSI'].median()
         # osi_df.groupby("cell_type")['OSI'].median()
         # convert to dict
-        osi_dsi_exp_dict = {key: {'OSI': val, 'DSI': dsi_target[key], 'ids': cell_ids[key]} for key, val in osi_target.to_dict().items()}
+        osi_dsi_exp_dict = {
+            key: {"OSI": val, "DSI": dsi_target[key], "ids": cell_ids[key]}
+            for key, val in osi_target.to_dict().items()
+        }
 
         return osi_dsi_exp_dict
-        
+
     def vonmises_model_fr(self, structure, population):
         from scipy.stats import vonmises
+
         paramdic = self._von_mises_params
         _params = paramdic[structure][population]
         if len(_params) == 4:
             mu, kappa, a, b = _params
         vonmises_pdf = vonmises(kappa, loc=mu).pdf
-        
-        angles = np.deg2rad(np.arange(-85, 86, 10)) * 2  # *2 needed to make it proper model
+
+        angles = (
+            np.deg2rad(np.arange(-85, 86, 10)) * 2
+        )  # *2 needed to make it proper model
         model_fr = a + b * vonmises_pdf(angles)
 
         return model_fr
-    
+
     def neuropixels_fr_loss(self, spikes, angle):
         # if the trget fr is not set, construct them
         if not hasattr(self, "_target_frs"):
 
             # self._von_mises_params = np.load("GLIF_network/param_dict_orientation.npy")
             # pickle instead
-            with open("GLIF_network/param_dict_orientation.pkl", 'rb') as f:
+            with open("GLIF_network/param_dict_orientation.pkl", "rb") as f:
                 self._von_mises_params = pkl.load(f)
-            # get the model values with 10 degree increments 
+            # get the model values with 10 degree increments
             structure = "VISp"
             self._target_frs = {}
             for key in self._layer_info.keys():
                 self._target_frs[key] = self.vonmises_model_fr(structure, key)
                 # TODO: convert it to tensor if needed.
-        
+
         # assuming 1 ms bins
         spike_rates = tf.reduce_mean(spikes, axis=[0, 1]) / spikes.shape[1] * 1000
         angle_bins = tf.constant(np.arange(-90, 91, 10), dtype=self._dtype)
@@ -642,17 +820,18 @@ class OrientationSelectivityLoss:
         # losses = tf.TensorArray(tf.float32, size=len(self._layer_info))
         losses = []
         delta_angle = self.calculate_delta_angle(angle, self._tuning_angles)
-        
+
         custom_mean_layer = CustomMeanLayer()
 
-        
         for key, value in self._layer_info.items():
             # first, calculate delta_angle
-            
+
             # rates = tf.TensorArray(tf.float32, size=nbins)
             rates_list = []
             for i in range(nbins):
-                mask = (delta_angle >= angle_bins[i]) & (delta_angle < angle_bins[i+1])
+                mask = (delta_angle >= angle_bins[i]) & (
+                    delta_angle < angle_bins[i + 1]
+                )
                 # take the intersection with core mask
                 mask = tf.logical_and(mask, self._core_mask)
                 mask = tf.logical_and(mask, value)
@@ -669,42 +848,47 @@ class OrientationSelectivityLoss:
             rates = tf.stack(rates_list)
             loss = tf.reduce_mean(tf.square(rates - self._target_frs[key]))
             # if key == "EXC_L6":
-                # print the results!
-                # tf.print("Layer6: ", rates)
-                # tf.print("target: ", self._target_frs[key])
+            # print the results!
+            # tf.print("Layer6: ", rates)
+            # tf.print("target: ", self._target_frs[key])
             # losses = losses.write(i, loss)
             losses.append(loss)
-        
+
         # final_loss = tf.reduce_sum(losses.stack()) * self._osi_cost
         final_loss = tf.reduce_mean(tf.stack(losses)) * self._osi_cost
         return final_loss
-        
+
     def crowd_spikes_loss(self, spikes, angle):
         # I need to access the tuning angle. of all the neurons.
         angle = tf.cast(angle, self._dtype)
 
         if self._core_mask is not None:
             spikes = tf.boolean_mask(spikes, self._core_mask, axis=2)
-            
+
         delta_angle = self.calculate_delta_angle(angle, self._tuning_angles)
         # sum spikes in _z, and multiply with delta_angle.
-        mean_spikes = tf.reduce_mean(spikes, axis=[1]) 
+        mean_spikes = tf.reduce_mean(spikes, axis=[1])
         mean_angle = mean_spikes * delta_angle
         # Here, the expected value with random firing to subtract
         # (this prevents the osi loss to drive the firing rates to go to zero.)
         expected_sum_angle = tf.reduce_mean(mean_spikes) * 45
-        
-        angle_loss = tf.reduce_mean(tf.abs(mean_angle)) - expected_sum_angle * self._subtraction_ratio
-        
+
+        angle_loss = (
+            tf.reduce_mean(tf.abs(mean_angle))
+            - expected_sum_angle * self._subtraction_ratio
+        )
+
         return angle_loss * self._osi_cost
-    
-    def crowd_osi_loss(self, spikes, angle, normalizer=None):  
+
+    def crowd_osi_loss(self, spikes, angle, normalizer=None):
         # Ensure angle is [batch_size] and cast to correct dtype
         angle = tf.cast(tf.reshape(angle, [-1]), self._dtype)  # [batch_size]
         # Compute delta_angle with broadcasting
-        delta_angle = angle[:, tf.newaxis] - self._tuning_angles[tf.newaxis, :]  # [batch_size, n_neurons_core]
+        delta_angle = (
+            angle[:, tf.newaxis] - self._tuning_angles[tf.newaxis, :]
+        )  # [batch_size, n_neurons_core]
         radians_delta_angle = delta_angle * (self._tf_pi / 180)
-            
+
         # Compute rates over time dimension
         rates = tf.reduce_mean(spikes, axis=1)  # [batch_size, n_neurons]
         if self._core_mask is not None:
@@ -723,12 +907,18 @@ class OrientationSelectivityLoss:
 
         batch_size = tf.shape(rates)[0]
         # Adjust segment_ids for batch dimension
-        batch_offsets = tf.range(batch_size, dtype=self.node_type_ids.dtype) * self._n_node_types  # [batch_size]
+        batch_offsets = (
+            tf.range(batch_size, dtype=self.node_type_ids.dtype) * self._n_node_types
+        )  # [batch_size]
         batch_offsets_expanded = batch_offsets[:, tf.newaxis]  # [batch_size, 1]
 
         segment_ids = self.node_type_ids[tf.newaxis, :]  # [1, n_neurons_core]
-        segment_ids = tf.tile(segment_ids, [batch_size, 1])  # [batch_size, n_neurons_core]
-        segment_ids = segment_ids + batch_offsets_expanded  # [batch_size, n_neurons_core]
+        segment_ids = tf.tile(
+            segment_ids, [batch_size, 1]
+        )  # [batch_size, n_neurons_core]
+        segment_ids = (
+            segment_ids + batch_offsets_expanded
+        )  # [batch_size, n_neurons_core]
 
         # Flatten data and segment_ids
         data_flat_rates = tf.reshape(rates, [-1])  # [batch_size * n_neurons_core]
@@ -739,28 +929,47 @@ class OrientationSelectivityLoss:
         num_segments = batch_size * self._n_node_types
 
         # Compute denominators and numerators
-        approximated_denominator = tf.math.unsorted_segment_mean(data_flat_rates, segment_ids_flat, num_segments=num_segments)
-        approximated_denominator = tf.reshape(approximated_denominator, [batch_size, self._n_node_types])
-        approximated_denominator = tf.maximum(approximated_denominator, self._min_rates_threshold)
+        approximated_denominator = tf.math.unsorted_segment_mean(
+            data_flat_rates, segment_ids_flat, num_segments=num_segments
+        )
+        approximated_denominator = tf.reshape(
+            approximated_denominator, [batch_size, self._n_node_types]
+        )
+        approximated_denominator = tf.maximum(
+            approximated_denominator, self._min_rates_threshold
+        )
 
-        osi_numerator = tf.math.unsorted_segment_mean(data_flat_weighted_osi, segment_ids_flat, num_segments=num_segments)
+        osi_numerator = tf.math.unsorted_segment_mean(
+            data_flat_weighted_osi, segment_ids_flat, num_segments=num_segments
+        )
         osi_numerator = tf.reshape(osi_numerator, [batch_size, self._n_node_types])
 
-        dsi_numerator = tf.math.unsorted_segment_mean(data_flat_weighted_dsi, segment_ids_flat, num_segments=num_segments)
+        dsi_numerator = tf.math.unsorted_segment_mean(
+            data_flat_weighted_dsi, segment_ids_flat, num_segments=num_segments
+        )
         dsi_numerator = tf.reshape(dsi_numerator, [batch_size, self._n_node_types])
 
         # Compute approximations
-        osi_approx_type = osi_numerator / approximated_denominator  # [batch_size, n_node_types]
+        osi_approx_type = (
+            osi_numerator / approximated_denominator
+        )  # [batch_size, n_node_types]
         dsi_approx_type = dsi_numerator / approximated_denominator
 
         # Compute losses
         # osi_target_values = self.osi_target_values[tf.newaxis, :]  # [1, n_node_types]
         # dsi_target_values = self.dsi_target_values[tf.newaxis, :]  # [1, n_node_types]
-        osi_loss_type = tf.math.square(osi_approx_type - self.osi_target_values[tf.newaxis, :])  # [batch_size, n_node_types]
-        dsi_loss_type = tf.math.square(dsi_approx_type - self.dsi_target_values[tf.newaxis, :])
+        osi_loss_type = tf.math.square(
+            osi_approx_type - self.osi_target_values[tf.newaxis, :]
+        )  # [batch_size, n_node_types]
+        dsi_loss_type = tf.math.square(
+            dsi_approx_type - self.dsi_target_values[tf.newaxis, :]
+        )
 
         # cell_type_count = self.cell_type_count[tf.newaxis, :]  # [1, n_node_types]
-        numerator = tf.reduce_sum((osi_loss_type + dsi_loss_type) * self.cell_type_count[tf.newaxis, :], axis=1)  # [batch_size]
+        numerator = tf.reduce_sum(
+            (osi_loss_type + dsi_loss_type) * self.cell_type_count[tf.newaxis, :],
+            axis=1,
+        )  # [batch_size]
         denominator = tf.reduce_sum(self.cell_type_count)  # Scalar
 
         total_loss_per_batch = numerator / denominator  # [batch_size]
@@ -770,7 +979,9 @@ class OrientationSelectivityLoss:
 
     def __call__(self, spikes, angle, trim, normalizer=None):
 
-        spikes = spike_trimming(spikes, pre_delay=self._pre_delay, post_delay=self._post_delay, trim=trim)
+        spikes = spike_trimming(
+            spikes, pre_delay=self._pre_delay, post_delay=self._post_delay, trim=trim
+        )
 
         if self._method == "crowd_osi":
             return self.crowd_osi_loss(spikes, angle, normalizer=normalizer)
@@ -778,4 +989,3 @@ class OrientationSelectivityLoss:
             return self.crowd_spikes_loss(spikes, angle)
         elif self._method == "neuropixels_fr":
             return self.neuropixels_fr_loss(spikes, angle)
-        
