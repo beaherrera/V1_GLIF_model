@@ -371,15 +371,27 @@ def main(_):
     n_iterations = int(np.ceil(flags.n_trials_per_angle / per_replica_batch_size))
     chunk_size = flags.seq_len
     num_chunks = int(np.ceil(sim_duration/chunk_size))
-    spikes = np.zeros((flags.n_trials_per_angle, len(DG_angles), sim_duration, network['n_nodes']), dtype=np.uint8)
+    
+    # Determine which neurons to track based on track_core_only flag
+    if flags.track_core_only:
+        from v1_model_utils import other_v1_utils
+        core_mask = other_v1_utils.isolate_core_neurons(network, radius=flags.plot_core_radius, data_dir=flags.data_dir)
+        n_tracked_neurons = np.sum(core_mask)
+        print(f"Tracking only core neurons: {n_tracked_neurons} out of {network['n_nodes']} total neurons")
+    else:
+        core_mask = None
+        n_tracked_neurons = network['n_nodes']
+        print(f"Tracking all neurons: {n_tracked_neurons}")
+    
+    spikes = np.zeros((flags.n_trials_per_angle, len(DG_angles), sim_duration, n_tracked_neurons), dtype=np.uint8)
 
     for angle_id, angle in enumerate(DG_angles):
-        print(f'Running angle {angle}...')
-        # load LGN firign rates for the given angle and calculate spiking probability
-        t0 = time()
+        print(f'Running angle {angle}...')        
         # load LGN firing rates for the given angle and calculate spiking probability
         lgn_prob = lgn_firing_probabilities_dict[angle]
         lgn_prob = tf.tile(tf.expand_dims(lgn_prob, axis=0), [per_replica_batch_size, 1, 1])
+
+        t0 = time()
 
         for iter_id in range(n_iterations):
             start_idx = iter_id * per_replica_batch_size
@@ -389,29 +401,39 @@ def main(_):
             lgn_spikes = generate_spontaneous_spikes(lgn_prob)
             # Reset the memory stats
             # tf.config.experimental.reset_memory_stats('GPU:0')
-
-            # Start tracking time for this angle
-            iter_start_time = time()            
+        
             for i in range(num_chunks):
                 chunk = lgn_spikes[:, i * chunk_size : (i + 1) * chunk_size, :]
                 v1_z_chunk, continuing_state = distributed_roll_out(chunk, continuing_state)
-                # v1_spikes[angle_id, i * chunk_size : (i + 1) * chunk_size, :] += v1_z_chunk.numpy()[0, :, :].astype(float)
-                # lm_spikes[angle_id, i * chunk_size : (i + 1) * chunk_size, :] += lm_z_chunk.numpy()[0, :, :].astype(float)
-                spikes[start_idx:end_idx, angle_id, i * chunk_size : (i + 1) * chunk_size, :] += v1_z_chunk.numpy()[:iteration_length, :, :].astype(np.uint8)
+                # Extract spikes based on tracking mode
+                if flags.track_core_only:
+                    tracked_spikes = v1_z_chunk.numpy()[:iteration_length, :, core_mask].astype(np.uint8)
+                else:
+                    tracked_spikes = v1_z_chunk.numpy()[:iteration_length, :, :].astype(np.uint8)
+                spikes[start_idx:end_idx, angle_id, i * chunk_size : (i + 1) * chunk_size, :] += tracked_spikes
                 
-            # Track GPU memory and inference time
-            callbacks.track_performance(iter_start_time, gpu_id=0)
-
-            if angle_id == 0:
-                # Raster plot for 0 degree orientation
-                callbacks.single_trial_callbacks(lgn_spikes.numpy(), spikes[:, 0, :, :], y=angle)
+        # Track GPU memory and inference time
+        # average_rate = np.mean(spikes[start_idx:end_idx, angle_id, :, :].astype(np.float32))
+        average_rate = np.mean(spikes[:, angle_id, :, :].astype(np.float32))
+        callbacks.track_performance(t0, average_rate=average_rate, gpu_id=0)
     
-            print(f'    Angle processing time: {time() - t0:.2f}s')
-            for gpu_id in range(len(strategy.extended.worker_devices)):
-                printgpu(gpu_id=gpu_id)
+        print(f'    Angle processing time: {time() - t0:.2f}s')
+        for gpu_id in range(len(strategy.extended.worker_devices)):
+            printgpu(gpu_id=gpu_id)
 
-            if not flags.calculate_osi_dsi:
-                break
+        if angle_id == 0:
+            # Raster plot for 0 degree orientation
+            callbacks.single_trial_callbacks(lgn_spikes.numpy(), spikes[:, 0, :, :], y=angle)
+
+        if not flags.calculate_osi_dsi:
+            break
+
+    # Save the performance metrics
+    callbacks.save_inference_metrics()
+
+    # Do the OSI/DSI analysis       
+    if flags.calculate_osi_dsi:
+        callbacks.osi_dsi_analysis(spikes, DG_angles)
 
     # # Save the spikes in a pickle file
     # from v1_model_utils import other_v1_utils
@@ -420,10 +442,6 @@ def main(_):
     # import pickle as pkl
     # with open(f'v1_core_osi_spikes.pkl', 'wb') as f:
     #     pkl.dump(spikes_plot, f)
-
-    # Do the OSI/DSI analysis       
-    if flags.calculate_osi_dsi:
-        callbacks.osi_dsi_analysis(spikes, DG_angles)
 
 
 if __name__ == '__main__':
@@ -453,6 +471,7 @@ if __name__ == '__main__':
     absl.app.flags.DEFINE_float('gauss_std', .3, '')
     absl.app.flags.DEFINE_float('recurrent_weight_regularization', 0., '')
     absl.app.flags.DEFINE_string('recurrent_weight_regularizer_type', "mean", '')
+    absl.app.flags.DEFINE_string('voltage_penalty_mode', 'range', '')
     absl.app.flags.DEFINE_float('lr_scale', 1., '')
     absl.app.flags.DEFINE_float('temporal_f', 2., '')
     absl.app.flags.DEFINE_float('max_time', -1, '')
@@ -509,6 +528,7 @@ if __name__ == '__main__':
     absl.app.flags.DEFINE_boolean('uniform_weights', False, '')
     absl.app.flags.DEFINE_boolean("current_input", False, "")
     absl.app.flags.DEFINE_boolean("gradient_checkpointing", True, "")
+    absl.app.flags.DEFINE_boolean("track_core_only", False, "Track spikes only from core neurons to reduce memory usage")
 
     absl.app.flags.DEFINE_string("rotation", "ccw", "")
     absl.app.flags.DEFINE_string('ckpt_dir', '', '')

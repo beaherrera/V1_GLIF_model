@@ -294,6 +294,80 @@ class L2Regularizer(tf.keras.regularizers.Regularizer):
             mse = self._strength * tf.reduce_mean(tf.square(relative_deviation))
             return tf.cast(mse, dtype=self._dtype)
 
+class EarthMoversDistanceRegularizer(Layer):
+    """
+    Regularizer that penalizes the Earth Mover's Distance (Wasserstein-1) between the current and initial
+    synaptic weight distributions, per edge type, averaged over all edge types.
+    Uses TF operations for initialization and tf.map_fn in call for memory efficiency.
+    """
+    def __init__(self, strength, network, dtype=tf.float32):
+        super().__init__()
+        self._strength = tf.cast(strength, dtype)
+        self._dtype = dtype
+
+        # --- Original Initialization Logic ---
+        voltage_scale = (network['node_params']['V_th'] - network['node_params']['E_L']).astype(np.float32)
+        indices = network["synapses"]["indices"]
+        initial_value_np = np.array(network["synapses"]["weights"], dtype=np.float32)
+        # edge_type_ids_np = network['synapses']['edge_type_ids']
+        # use the connection_type_ids instead
+        edge_type_ids_np = other_v1_utils.connection_type_ids(network)
+        initial_value_np /= voltage_scale[network['node_type_ids'][indices[:, 0]]]
+        n_edges = len(initial_value_np)
+        # --- End Original Initialization Logic ---
+
+        # Convert to TF Tensors
+        initial_value = tf.constant(initial_value_np, dtype=tf.float32)
+        edge_type_ids = tf.constant(edge_type_ids_np, dtype=tf.int32)
+        
+        unique_edge_types, idx = np.unique(edge_type_ids, return_inverse=True)
+        self.num_unique = tf.constant(unique_edge_types.shape[0], dtype=tf.int32)
+
+        self._initial_value = tf.constant(initial_value, dtype=tf.float32)
+        
+        
+        # presort the initial value
+        for i in tf.range(self.num_unique):
+            mask = tf.equal(idx, i)
+            y_i = tf.boolean_mask(self._initial_value, mask)
+            y_i = tf.sort(y_i)
+            self._initial_value = tf.tensor_scatter_nd_update(self._initial_value, tf.where(mask), y_i)
+
+
+        ### 2. Reorder original_indices and initial_value based on sorted edge types
+        original_indices = tf.range(n_edges, dtype=tf.int32)
+        sorted_indices = tf.argsort(edge_type_ids)
+        permuted_original_indices = tf.gather(original_indices, sorted_indices)
+        sorted_edge_type_ids = tf.gather(edge_type_ids, sorted_indices) # Needed for unique
+
+        # 3. Find unique edge types and row indices for ragged tensor construction
+        unique_types, row_indices = tf.unique(sorted_edge_type_ids)
+        nrows = tf.shape(unique_types)[0]
+
+        # 4. Construct group_indices RaggedTensor (indices into the *original* weight tensor)
+        self._group_indices = tf.RaggedTensor.from_value_rowids(
+            values=permuted_original_indices,
+            value_rowids=row_indices,
+            nrows=nrows
+        )
+
+    @tf.function(jit_compile=False) # Do not use jit_compile=True. It uses a lot of memory.
+    def __call__(self, x):
+        x = tf.cast(x, tf.float32)
+        if len(x.shape) > 1 and x.shape[1] == 1:
+            x = tf.squeeze(x, axis=1)
+        emd_losses = tf.TensorArray(self._dtype, size=self.num_unique)
+        for i in tf.range(self.num_unique):
+            x_i = tf.gather(x, self._group_indices[i])
+            y_i = tf.gather(self._initial_value, self._group_indices[i])
+
+            # y_i is presorted.
+            emd = tf.reduce_mean(tf.abs(tf.sort(x_i) - y_i))
+            emd_losses = emd_losses.write(i, emd)
+        emd_losses = emd_losses.stack()
+        reg_loss = tf.reduce_mean(emd_losses)
+        return reg_loss * self._strength
+
 
 def spike_trimming(spikes, pre_delay=50, post_delay=50, trim=True):
     pre = pre_delay or 0
@@ -527,6 +601,10 @@ class SpikeRateDistributionTarget:
         #         spikes = spikes[:, :-self._post_delay, :]
 
         spikes = spike_trimming(spikes, pre_delay=self._pre_delay, post_delay=self._post_delay, trim=trim)
+
+        if spikes.dtype != self._dtype:
+            spikes = tf.cast(spikes, self._dtype)
+
         rates = tf.reduce_mean(spikes, (0, 1)) # calculate the mean firing rate over time and batch
 
         reg_loss = compute_spike_rate_target_loss(rates, self._target_rates, dtype=self._dtype) 
@@ -563,7 +641,7 @@ class SynchronizationLoss(Layer):
         self._n_samples = n_samples
         self._base_seed = seed
 
-        pop_names = other_v1_utils.pop_names(network)
+        pop_names = other_v1_utils.pop_names(network, data_dir='')
         if self._core_mask is not None:
             pop_names = pop_names[core_mask]
         node_ei = np.array([pop_name[0] for pop_name in pop_names])
@@ -638,7 +716,7 @@ class SynchronizationLoss(Layer):
         sample_counts = tf.clip_by_value(sample_counts, clip_value_min=15, clip_value_max=tf.shape(self.node_id_e)[0]) # clip the values to be between 15 and 14423
         # Randomize the neuron ids
         shuffled_e_ids = tf.random.shuffle(self.node_id_e, seed=self._base_seed)
-        selected_spikes_sample = tf.TensorArray(self._dtype, size=self._n_samples)
+        selected_spikes_sample = tf.TensorArray(spikes.dtype, size=self._n_samples)
         previous_id = tf.constant(0, dtype=tf.int32)
         for i in tf.range(self._n_samples):
             sample_num = sample_counts[i] # 40 #68
@@ -657,6 +735,9 @@ class SynchronizationLoss(Layer):
             selected_spikes_sample = selected_spikes_sample.write(i, selected_spikes)
 
         selected_spikes_sample = selected_spikes_sample.stack()
+        if selected_spikes_sample.dtype != self._dtype:
+            selected_spikes_sample = tf.cast(selected_spikes_sample, self._dtype)
+
         fanos_mean = self.pop_fano_tf(selected_spikes_sample, bin_sizes=bin_sizes)
         # # Calculate MSE between the experimental and calculated Fano factors
         mse_loss = tf.reduce_mean(tf.square(experimental_fanos_mean - fanos_mean))
@@ -667,30 +748,58 @@ class SynchronizationLoss(Layer):
    
 
 class VoltageRegularization:
-    def __init__(self, cell, voltage_cost=1e-5, dtype=tf.float32, core_mask=None):
-        self._voltage_cost = voltage_cost
+    def __init__(self, cell, voltage_cost=1e-5, dtype=tf.float32, core_mask=None, penalty_mode="range"):
+        """
+        Voltage regularization with two penalty modes.
+        
+        Args:
+            cell: The cell model
+            voltage_cost: Regularization coefficient
+            dtype: TensorFlow data type
+            core_mask: Boolean mask for selecting subset of neurons
+            penalty_mode: Either "range" or "threshold"
+                - "range": Penalizes voltages outside [0, 1] range
+                - "threshold": Penalizes distance from threshold (1.0)
+        """
+        self._voltage_cost = tf.constant(voltage_cost, dtype=dtype)
         self._cell = cell
         self._dtype = dtype
+        self._penalty_mode = penalty_mode
         self._core_mask = core_mask
-        # self._voltage_offset = tf.cast(self._cell.voltage_offset, dtype)
-        # self._voltage_scale = tf.cast(self._cell.voltage_scale, dtype)
-        # if core_mask is not None:
-        #     self._voltage_offset = tf.boolean_mask(self._voltage_offset, core_mask)
-        #     self._voltage_scale = tf.boolean_mask(self._voltage_scale, core_mask)
-
+        
+    @tf.function(jit_compile=True)
+    def _compute_range_loss(self, voltages):
+        """
+        JIT-compiled range loss computation.
+        
+        Fuses all operations into a single kernel, avoiding intermediate tensor allocations.
+        This is ~2-3x faster than the unfused version for large tensors.
+        """
+        # Single-pass computation: for each element, compute max(0, v-1)^2 + max(0, -v)^2
+        # This avoids creating separate intermediate tensors
+        upper_sq = tf.square(tf.nn.relu(voltages - 1.0))
+        lower_sq = tf.square(tf.nn.relu(-voltages))
+        return tf.reduce_mean(upper_sq + lower_sq)
+    
+    @tf.function(jit_compile=True)
+    def _compute_threshold_loss(self, voltages):
+        """JIT-compiled threshold loss computation."""
+        return tf.reduce_mean(tf.square(voltages - 1.0))
+        
     def __call__(self, voltages):
+
         if self._core_mask is not None:
             voltages = tf.boolean_mask(voltages, self._core_mask, axis=2)
-            
-        # voltages = (voltages - self._voltage_offset) / self._voltage_scale
-        # v_pos = tf.square(tf.nn.relu(voltages - 1.0))
-        # v_neg = tf.square(tf.nn.relu(-voltages + 1.0))
-        # voltage_loss = tf.reduce_mean(tf.reduce_mean(v_pos + v_neg, -1))
-        v_tot = tf.square(voltages - 1.0)
-        voltage_loss = tf.reduce_mean(v_tot)
+
+        if voltages.dtype != self._dtype:
+            voltages = tf.cast(voltages, self._dtype)
+
+        if self._penalty_mode == "range":
+            voltage_loss = self._compute_range_loss(voltages)
+        else:  # threshold mode
+            voltage_loss = self._compute_threshold_loss(voltages)
 
         return voltage_loss * self._voltage_cost
-    
 
 class CustomMeanLayer(Layer):
     def call(self, inputs):
@@ -702,7 +811,7 @@ class CustomMeanLayer(Layer):
 class OrientationSelectivityLoss:
     def __init__(self, network=None, osi_cost=1e-5, pre_delay=None, post_delay=None, dtype=tf.float32, 
                  core_mask=None, method="crowd_osi", subtraction_ratio=1.0, layer_info=None,
-                 neuropixels_df="Neuropixels_data/v1_OSI_DSI_DF.csv"):
+                 neuropixels_df="Neuropixels_data/v1_OSI_DSI_DF.csv", data_dir=''):
         
         self._network = network
         self._osi_cost = osi_cost
@@ -714,6 +823,7 @@ class OrientationSelectivityLoss:
         self._subtraction_ratio = subtraction_ratio  # only for crowd_spikes method
         self._tf_pi = tf.constant(np.pi, dtype=dtype)
         self._neuropixels_df = neuropixels_df
+        self.data_dir = data_dir
         if (self._core_mask is not None) and (self._method == "crowd_spikes" or self._method == "crowd_osi"):
             self.np_core_mask = self._core_mask.numpy()
             core_tuning_angles = network['tuning_angle'][self.np_core_mask]
@@ -800,7 +910,7 @@ class OrientationSelectivityLoss:
         osi_target = osi_dsi_df.groupby("cell_type")['OSI'].mean()
         dsi_target = osi_dsi_df.groupby("cell_type")['DSI'].mean()
 
-        original_pop_names = other_v1_utils.pop_names(self._network)
+        original_pop_names = other_v1_utils.pop_names(self._network, data_dir=self.data_dir)
         if self._core_mask is not None:
             original_pop_names = original_pop_names[self.np_core_mask] 
 
@@ -835,7 +945,7 @@ class OrientationSelectivityLoss:
 
             # self._von_mises_params = np.load("GLIF_network/param_dict_orientation.npy")
             # pickle instead
-            with open("GLIF_network/param_dict_orientation.pkl", 'rb') as f:
+            with open(f"{self.data_dir}/param_dict_orientation.pkl", 'rb') as f:
                 self._von_mises_params = pkl.load(f)
             # get the model values with 10 degree increments 
             structure = "VISp"
@@ -852,10 +962,8 @@ class OrientationSelectivityLoss:
         # losses = tf.TensorArray(tf.float32, size=len(self._layer_info))
         losses = []
         delta_angle = self.calculate_delta_angle(angle, self._tuning_angles)
-        
         custom_mean_layer = CustomMeanLayer()
 
-        
         for key, value in self._layer_info.items():
             # first, calculate delta_angle
             
@@ -908,6 +1016,57 @@ class OrientationSelectivityLoss:
         
         return angle_loss * self._osi_cost
     
+    @tf.function(jit_compile=True)
+    def _compute_osi_dsi_core(self, rates, radians_delta_angle, batch_size, node_type_ids, n_node_types):
+        """JIT-compiled core computation for OSI/DSI loss.
+        
+        Fuses segment operations and cosine computations for faster execution.
+        """
+        # Compute weighted responses using fused cos operations
+        cos_2x = tf.math.cos(2.0 * radians_delta_angle)
+        cos_x = tf.math.cos(radians_delta_angle)
+        weighted_osi_cos_responses = rates * cos_2x
+        weighted_dsi_cos_responses = rates * cos_x
+
+        # Segment IDs computation
+        batch_offsets = tf.range(batch_size, dtype=node_type_ids.dtype) * n_node_types
+        segment_ids = node_type_ids[tf.newaxis, :] + batch_offsets[:, tf.newaxis]
+
+        # Flatten data
+        data_flat_rates = tf.reshape(rates, [-1])
+        data_flat_weighted_osi = tf.reshape(weighted_osi_cos_responses, [-1])
+        data_flat_weighted_dsi = tf.reshape(weighted_dsi_cos_responses, [-1])
+        segment_ids_flat = tf.reshape(segment_ids, [-1])
+
+        num_segments = batch_size * n_node_types
+
+        # Compute denominators and numerators using segment operations
+        approximated_denominator = tf.math.unsorted_segment_mean(
+            data_flat_rates, segment_ids_flat, num_segments=num_segments
+        )
+        approximated_denominator = tf.reshape(approximated_denominator, [batch_size, n_node_types])
+        approximated_denominator = tf.maximum(approximated_denominator, 0.0005)  # min_rates_threshold
+
+        osi_numerator = tf.math.unsorted_segment_mean(
+            data_flat_weighted_osi, segment_ids_flat, num_segments=num_segments
+        )
+        osi_numerator = tf.reshape(osi_numerator, [batch_size, n_node_types])
+
+        dsi_numerator = tf.math.unsorted_segment_mean(
+            data_flat_weighted_dsi, segment_ids_flat, num_segments=num_segments
+        )
+        dsi_numerator = tf.reshape(dsi_numerator, [batch_size, n_node_types])
+
+        # Compute approximations
+        osi_approx_type = osi_numerator / approximated_denominator
+        dsi_approx_type = dsi_numerator / approximated_denominator
+
+        # Average over batch
+        osi_approx_type = tf.reduce_mean(osi_approx_type, axis=0)
+        dsi_approx_type = tf.reduce_mean(dsi_approx_type, axis=0)
+
+        return osi_approx_type, dsi_approx_type
+
     def crowd_osi_loss(self, spikes, angle, normalizer=None):  
         # Ensure angle is [batch_size] and cast to correct dtype
         angle = tf.cast(tf.reshape(angle, [-1]), self._dtype)  # [batch_size]
@@ -923,62 +1082,23 @@ class OrientationSelectivityLoss:
         if normalizer is not None:
             if self._core_mask is not None:
                 normalizer = tf.boolean_mask(normalizer, self._core_mask, axis=0)
-            # Use tf.maximum to ensure each element of normalizer does not fall below min_normalizer_value
             normalizer = tf.maximum(normalizer, self._min_rates_threshold)
             rates = rates / normalizer
 
-        # Instead of complex numbers, use cosine and sine separately
-        weighted_osi_cos_responses = rates * tf.math.cos(2.0 * radians_delta_angle)
-        weighted_dsi_cos_responses = rates * tf.math.cos(radians_delta_angle)
-
         batch_size = tf.shape(rates)[0]
-        # Adjust segment_ids for batch dimension
-        batch_offsets = tf.range(batch_size, dtype=self.node_type_ids.dtype) * self._n_node_types  # [batch_size]
-        batch_offsets_expanded = batch_offsets[:, tf.newaxis]  # [batch_size, 1]
-
-        segment_ids = self.node_type_ids[tf.newaxis, :]  # [1, n_neurons_core]
-        segment_ids = tf.tile(segment_ids, [batch_size, 1])  # [batch_size, n_neurons_core]
-        segment_ids = segment_ids + batch_offsets_expanded  # [batch_size, n_neurons_core]
-
-        # Flatten data and segment_ids
-        data_flat_rates = tf.reshape(rates, [-1])  # [batch_size * n_neurons_core]
-        data_flat_weighted_osi = tf.reshape(weighted_osi_cos_responses, [-1])
-        data_flat_weighted_dsi = tf.reshape(weighted_dsi_cos_responses, [-1])
-        segment_ids_flat = tf.reshape(segment_ids, [-1])
-
-        num_segments = batch_size * self._n_node_types
-
-        # Compute denominators and numerators
-        approximated_denominator = tf.math.unsorted_segment_mean(data_flat_rates, segment_ids_flat, num_segments=num_segments)
-        approximated_denominator = tf.reshape(approximated_denominator, [batch_size, self._n_node_types])
-        approximated_denominator = tf.maximum(approximated_denominator, self._min_rates_threshold)
-
-        osi_numerator = tf.math.unsorted_segment_mean(data_flat_weighted_osi, segment_ids_flat, num_segments=num_segments)
-        osi_numerator = tf.reshape(osi_numerator, [batch_size, self._n_node_types])
-
-        dsi_numerator = tf.math.unsorted_segment_mean(data_flat_weighted_dsi, segment_ids_flat, num_segments=num_segments)
-        dsi_numerator = tf.reshape(dsi_numerator, [batch_size, self._n_node_types])
-
-        # Compute approximations
-        osi_approx_type = osi_numerator / approximated_denominator  # [batch_size, n_node_types]
-        dsi_approx_type = dsi_numerator / approximated_denominator
-
-        # Average over batch size
-        osi_approx_type = tf.reduce_mean(osi_approx_type, axis=0)
-        dsi_approx_type = tf.reduce_mean(dsi_approx_type, axis=0)
+        
+        # Use JIT-compiled core computation
+        osi_approx_type, dsi_approx_type = self._compute_osi_dsi_core(
+            rates, radians_delta_angle, batch_size, 
+            self.node_type_ids, self._n_node_types
+        )
 
         # Compute losses
-        # osi_target_values = self.osi_target_values[tf.newaxis, :]  # [1, n_node_types]
-        # dsi_target_values = self.dsi_target_values[tf.newaxis, :]  # [1, n_node_types]
-        osi_loss_type = tf.math.square(osi_approx_type - self.osi_target_values)  # [n_node_types]
+        osi_loss_type = tf.math.square(osi_approx_type - self.osi_target_values)
         dsi_loss_type = tf.math.square(dsi_approx_type - self.dsi_target_values)
     
-        # cell_type_count = self.cell_type_count[tf.newaxis, :]  # [1, n_node_types]
-        numerator = tf.reduce_sum((osi_loss_type + dsi_loss_type) * self.cell_type_count)  # [1]
-        denominator = tf.reduce_sum(self.cell_type_count)  # Scalar
-
-        # total_loss_per_batch = numerator / denominator  # [batch_size]
-        # total_loss = tf.reduce_mean(total_loss_per_batch) * self._osi_cost
+        numerator = tf.reduce_sum((osi_loss_type + dsi_loss_type) * self.cell_type_count)
+        denominator = tf.reduce_sum(self.cell_type_count)
 
         total_loss = (numerator / denominator) * self._osi_cost
 
@@ -988,84 +1108,12 @@ class OrientationSelectivityLoss:
 
         spikes = spike_trimming(spikes, pre_delay=self._pre_delay, post_delay=self._post_delay, trim=trim)
 
+        if spikes.dtype != self._dtype:
+            spikes = tf.cast(spikes, self._dtype)
+
         if self._method == "crowd_osi":
             return self.crowd_osi_loss(spikes, angle, normalizer=normalizer)
         elif self._method == "crowd_spikes":
             return self.crowd_spikes_loss(spikes, angle)
         elif self._method == "neuropixels_fr":
             return self.neuropixels_fr_loss(spikes, angle)
-
-
-class EarthMoversDistanceRegularizer(Layer):
-    """
-    Regularizer that penalizes the Earth Mover's Distance (Wasserstein-1) between the current and initial
-    synaptic weight distributions, per edge type, averaged over all edge types.
-    Uses TF operations for initialization and tf.map_fn in call for memory efficiency.
-    """
-    def __init__(self, strength, network, dtype=tf.float32):
-        super().__init__()
-        self._strength = tf.cast(strength, dtype)
-        self._dtype = dtype
-
-        # --- Original Initialization Logic ---
-        voltage_scale = (network['node_params']['V_th'] - network['node_params']['E_L']).astype(np.float32)
-        indices = network["synapses"]["indices"]
-        initial_value_np = np.array(network["synapses"]["weights"], dtype=np.float32)
-        # edge_type_ids_np = network['synapses']['edge_type_ids']
-        # use the connection_type_ids instead
-        edge_type_ids_np = other_v1_utils.connection_type_ids(network)
-        initial_value_np /= voltage_scale[network['node_type_ids'][indices[:, 0]]]
-        n_edges = len(initial_value_np)
-        # --- End Original Initialization Logic ---
-
-        # Convert to TF Tensors
-        initial_value = tf.constant(initial_value_np, dtype=tf.float32)
-        edge_type_ids = tf.constant(edge_type_ids_np, dtype=tf.int32)
-        
-        unique_edge_types, idx = np.unique(edge_type_ids, return_inverse=True)
-        self.num_unique = tf.constant(unique_edge_types.shape[0], dtype=tf.int32)
-
-        self._initial_value = tf.constant(initial_value, dtype=tf.float32)
-        
-        
-        # presort the initial value
-        for i in tf.range(self.num_unique):
-            mask = tf.equal(idx, i)
-            y_i = tf.boolean_mask(self._initial_value, mask)
-            y_i = tf.sort(y_i)
-            self._initial_value = tf.tensor_scatter_nd_update(self._initial_value, tf.where(mask), y_i)
-
-
-        ### 2. Reorder original_indices and initial_value based on sorted edge types
-        original_indices = tf.range(n_edges, dtype=tf.int32)
-        sorted_indices = tf.argsort(edge_type_ids)
-        permuted_original_indices = tf.gather(original_indices, sorted_indices)
-        sorted_edge_type_ids = tf.gather(edge_type_ids, sorted_indices) # Needed for unique
-
-        # 3. Find unique edge types and row indices for ragged tensor construction
-        unique_types, row_indices = tf.unique(sorted_edge_type_ids)
-        nrows = tf.shape(unique_types)[0]
-
-        # 4. Construct group_indices RaggedTensor (indices into the *original* weight tensor)
-        self._group_indices = tf.RaggedTensor.from_value_rowids(
-            values=permuted_original_indices,
-            value_rowids=row_indices,
-            nrows=nrows
-        )
-
-    @tf.function(jit_compile=False) # Do not use jit_compile=True. It uses a lot of memory.
-    def __call__(self, x):
-        x = tf.cast(x, tf.float32)
-        if len(x.shape) > 1 and x.shape[1] == 1:
-            x = tf.squeeze(x, axis=1)
-        emd_losses = tf.TensorArray(self._dtype, size=self.num_unique)
-        for i in tf.range(self.num_unique):
-            x_i = tf.gather(x, self._group_indices[i])
-            y_i = tf.gather(self._initial_value, self._group_indices[i])
-
-            # y_i is presorted.
-            emd = tf.reduce_mean(tf.abs(tf.sort(x_i) - y_i))
-            emd_losses = emd_losses.write(i, emd)
-        emd_losses = emd_losses.stack()
-        reg_loss = tf.reduce_mean(emd_losses)
-        return reg_loss * self._strength

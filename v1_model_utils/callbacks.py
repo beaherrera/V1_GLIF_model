@@ -47,7 +47,7 @@ if shutil.which('latex') is not None:
 else:
     use_tex = False
     print("LaTeX not found. Using MathText for rendering.")
-plt.rcParams['text.usetex'] = use_tex
+plt.rcParams['text.usetex'] = False #use_tex
 
 def printgpu(gpu_id=0):
     if tf.config.list_physical_devices('GPU'):
@@ -176,6 +176,7 @@ class OsiDsiCallbacks:
     def __init__(self, network, lgn_input, bkg_input, flags, logdir, current_epoch=0,
                 pre_delay=50, post_delay=50, model_variables_init=None):
         self.n_neurons = flags.neurons
+        self.n_edges = network['n_edges'] + len(lgn_input['weights'])
         self.network = network
         self.lgn_input = lgn_input
         self.bkg_input = bkg_input
@@ -191,6 +192,7 @@ class OsiDsiCallbacks:
         # Tracking inference performance metrics
         self.inference_times = []
         self.inference_memory = []
+        self.inference_rates = []
         # Analyze changes in trainable variables.
         if self.model_variables_dict is not None:
             for var in self.model_variables_dict['Best'].keys():
@@ -202,8 +204,8 @@ class OsiDsiCallbacks:
     def save_inference_metrics(self):
         # Calculate training statistics and save to CSV
         # Get the simulation name (last part of logdir)
-        sim_name = os.path.basename(self.logdir)
-        
+        sim_name = os.path.dirname(os.path.dirname(os.path.basename(self.logdir)))
+
         # Calculate statistics for step time
         mean_step_time = np.mean(self.inference_times)
         sem_step_time = np.std(self.inference_times) / np.sqrt(len(self.inference_times))
@@ -218,9 +220,13 @@ class OsiDsiCallbacks:
             mean_gpu_memory = 0.0
             sem_gpu_memory = 0.0
 
+        # Calculate average firing rate
+        mean_rate = np.mean(self.inference_rates)
+        sem_rate = np.std(self.inference_rates) / np.sqrt(len(self.inference_rates))
+
         # Create a directory for saving statistics if it doesn't exist
-        stats_dir = os.path.dirname(os.path.dirname(self.logdir))  # Go up to Simulation_results
-        stats_file = os.path.join(stats_dir, 'training_statistics.csv')
+        stats_dir = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(self.logdir))))  # Go up to Simulation_results
+        stats_file = os.path.join(stats_dir, 'performance_statistics.csv')
         
         # Check if file exists to determine if we need to write headers
         file_exists = os.path.isfile(stats_file)
@@ -229,11 +235,11 @@ class OsiDsiCallbacks:
         with open(stats_file, 'a') as f:
             if not file_exists:
                 # Write header if file doesn't exist
-                f.write('sim_name,n_neurons,batch_size,seq_len,mean_step_time,sem_step_time,mean_gpu_memory,sem_gpu_memory,mode\n')
+                f.write('sim_name,n_neurons,n_edges,batch_size,seq_len,mean_rate,sem_rate,mean_step_time,sem_step_time,mean_gpu_memory,sem_gpu_memory,mode\n')
             # Write data
-            f.write(f'{sim_name},{self.n_neurons},{self.flags.n_trials_per_angle},{self.sim_duration},'
-                     f'{mean_step_time},{sem_step_time},{mean_gpu_memory},{sem_gpu_memory},'
-                     'test')
+            f.write(f'{sim_name},{self.n_neurons},{self.n_edges},{self.flags.n_trials_per_angle},{self.sim_duration},'
+                     f'{mean_rate:.4f},{sem_rate:.4f},{mean_step_time:.4f},{sem_step_time:.4f},{mean_gpu_memory:.4f},{sem_gpu_memory:.4f},"test"\n')
+                     
         
         print(f"Inference metrics saved to {stats_file}")
 
@@ -248,9 +254,10 @@ class OsiDsiCallbacks:
         inference_time = end_time - start_time
         self.inference_times.append(inference_time)
 
-    def track_performance(self, start_time, gpu_id=0):
+    def track_performance(self, start_time, average_rate, gpu_id=0):
         self.track_inference_time(start_time)
         self.track_gpu_memory(gpu_id=gpu_id)
+        self.inference_rates.append(average_rate)
 
     def trainable_variable_change_heatmaps_and_distributions(self, variable):
         node_types_voltage_scale = (self.network['node_params']['V_th'] - self.network['node_params']['E_L']).astype(np.float32)
@@ -672,7 +679,7 @@ class OsiDsiCallbacks:
 
             # plt.tight_layout(rect=[0, 0, 0.9, 1])  # Adjust layout to make room for colorbar
             plt.tight_layout()
-            plt.savefig(os.path.join(boxplots_dir, f'Initial_weight.png'), dpi=300, transparent=True, bbox_inches='tight')
+            plt.savefig(os.path.join(boxplots_dir, f'Initial_weight.png'), dpi=300, transparent=False, bbox_inches='tight')
             plt.close()
 
         ### Final Weight ###
@@ -732,25 +739,26 @@ class OsiDsiCallbacks:
         t_start_idx = int(t_start * 1000)
         t_end_idx = int(t_end * 1000)
         spikes = spikes[:, :, t_start_idx:t_end_idx, :]
-
-        if analyze_core_only:
-            # Isolate the core neurons
-            # pop_names = other_v1_utils.pop_names(self.network, core_radius=self.flags.loss_core_radius, data_dir=self.flags.data_dir)
-            core_mask = other_v1_utils.isolate_core_neurons(self.network, radius=self.flags.loss_core_radius, data_dir=self.flags.data_dir)
-            n_core_neurons = np.sum(core_mask)
-            # spikes = spikes[:, :, :, core_mask]
-        else:
-            n_core_neurons = spikes.shape[-1]
-            core_mask = np.ones(n_core_neurons, dtype=bool)
-            # pop_names = other_v1_utils.pop_names(self.network, data_dir=self.flags.data_dir)
-
-        # Calculate the Fano Factor for the spikes
         pop_names = other_v1_utils.pop_names(self.network, data_dir=self.flags.data_dir)
         node_ei = np.array([pop_name[0] for pop_name in pop_names])
+
+        if analyze_core_only:
+            core_mask = other_v1_utils.isolate_core_neurons(self.network, radius=self.flags.loss_core_radius, data_dir=self.flags.data_dir)
+            node_ei = node_ei[core_mask]
+            n_neurons = np.sum(core_mask)
+
+            if spikes.shape[3] != n_neurons and spikes.shape[3] == len(core_mask):
+                # If the spikes tensor is already core-only, we can use the provided mask
+                spikes = spikes[:, :, :, core_mask]
+            elif spikes.shape[3] != n_neurons and spikes.shape[3] != len(core_mask):
+                # If the spikes tensor is not core-only, we need to apply the core isolation
+                raise ValueError(f"Spikes tensor shape mismatch: expected {n_neurons} neurons, but got {spikes.shape[3]} neurons in the spikes tensor.")
+
         # Get the IDs for excitatory neurons
-        total_mask = np.logical_and(node_ei == 'e', core_mask)
-        n_e_neurons = np.sum(total_mask)
-        spikes = spikes[:, :, :, total_mask]
+        e_mask = node_ei == 'e'
+        n_e_neurons = np.sum(e_mask)
+        spikes = spikes[:, :, :, e_mask]
+
         node_id_e = np.arange(0, n_e_neurons)
         # Reshape the spikes tensor to have the shape (n_trials, seq_len, n_neurons)
         spikes = np.reshape(spikes, [spikes.shape[0]*spikes.shape[1], spikes.shape[2], spikes.shape[3]])
@@ -797,11 +805,13 @@ class OsiDsiCallbacks:
         # Calculate fano factors for both sessions
         evoked_t_start_seconds = self.pre_delay / 1000 + 0.2
         evoked_t_end_seconds = evoked_t_start_seconds + evoked_fano_duration / 1000
-        evoked_fanos, evoked_bin_sizes = self.fano_factor(spikes, t_start=evoked_t_start_seconds, t_end=evoked_t_end_seconds, n_samples=n_samples, analyze_core_only=analyze_core_only)
+        evoked_fanos, evoked_bin_sizes = self.fano_factor(spikes, t_start=evoked_t_start_seconds, t_end=evoked_t_end_seconds, 
+                                                          n_samples=n_samples, analyze_core_only=analyze_core_only)
         
         spont_t_start_seconds = 0.2
         spont_t_end_seconds = spont_t_start_seconds + spont_fano_duration / 1000
-        spontaneous_fanos, spont_bin_sizes = self.fano_factor(spikes, t_start=spont_t_start_seconds, t_end=spont_t_end_seconds, n_samples=n_samples, analyze_core_only=analyze_core_only)
+        spontaneous_fanos, spont_bin_sizes = self.fano_factor(spikes, t_start=spont_t_start_seconds, t_end=spont_t_end_seconds, 
+                                                             n_samples=n_samples, analyze_core_only=analyze_core_only)
     
         # Calculate mean, standard deviation, and SEM of the Fano factors
         evoked_fanos_mean = np.nanmean(evoked_fanos, axis=0)
@@ -979,18 +989,24 @@ class OsiDsiCallbacks:
                                     )
         graph(x, v1_spikes)
 
-    def plot_population_firing_rates_vs_tuning_angle(self, spikes, DG_angles, core_radius=400):
+    def plot_population_firing_rates_vs_tuning_angle(self, spikes, DG_angles, analyze_core_only=True):
         # Save the spikes
         spikes_dir = os.path.join(self.images_dir, 'Spikes_OSI_DSI')
         os.makedirs(spikes_dir, exist_ok=True)
 
-        # Isolate the core neurons
-        core_mask = other_v1_utils.isolate_core_neurons(self.network, radius=self.flags.plot_core_radius, data_dir=self.flags.data_dir)
-        spikes = spikes[:, :, :, core_mask]
+        tuning_angles = self.network['tuning_angle']
+
+        # Handle core masking based on input data
+        if analyze_core_only:
+            core_mask = other_v1_utils.isolate_core_neurons(self.network, radius=self.flags.plot_core_radius, data_dir=self.flags.data_dir)
+            if spikes.shape[3] != np.sum(core_mask) and spikes.shape[3] == len(core_mask):
+                spikes = spikes[:, :, :, core_mask]
+            
+            tuning_angles = tuning_angles[core_mask]
+        
         spikes = np.sum(spikes, axis=0).astype(np.float32)/self.flags.n_trials_per_angle
         seq_len = spikes.shape[1]
 
-        tuning_angles = self.network['tuning_angle'][core_mask]
         for angle_id, angle in enumerate(DG_angles):
             firingRates = calculate_Firing_Rate(spikes[angle_id, :, :], stimulus_init=self.pre_delay, stimulus_end=seq_len-self.post_delay, temporal_axis=0)
             x = tuning_angles
@@ -1020,7 +1036,8 @@ class OsiDsiCallbacks:
     def osi_dsi_analysis(self, v1_spikes, DG_angles):
         ### Power spectral analysis
         psd_analyzer = PSDAnalyzer(self.network, fs=1.0, analyze_core_only=True, population_average=True, normalize=False, normalize_by_n2=True, 
-                                   normalize_by_rate=False, save_path=os.path.join(self.images_dir, 'Power_Spectrum'), data_dir=self.flags.data_dir)
+                                   normalize_by_rate=False, save_path=os.path.join(self.images_dir, 'Power_Spectrum'), data_dir=self.flags.data_dir, 
+                                   radius=self.flags.plot_core_radius)
         stimulus_duration = v1_spikes.shape[2]
         psd_analyzer(v1_spikes, t_spont_start=0, t_spont_end=self.pre_delay, t_evoked_start=self.pre_delay+0, t_evoked_end=stimulus_duration-self.post_delay)
 
@@ -1038,9 +1055,9 @@ class OsiDsiCallbacks:
         self.fanos_figure(v1_spikes, n_samples=1000, spont_fano_duration=300, evoked_fano_duration=300, analyze_core_only=True)
         self.fanos_figure(v1_spikes, n_samples=1000, spont_fano_duration=1800, evoked_fano_duration=1800, analyze_core_only=True)
         print('Fanos figure saved in ', time() - t_fano0, ' seconds!\n')
-        # Plot the tuning angle analysis
-        self.plot_population_firing_rates_vs_tuning_angle(v1_spikes, DG_angles)
-        # Estimate tuning parameters from the model neurons
+        # # Plot the tuning angle analysis
+        self.plot_population_firing_rates_vs_tuning_angle(v1_spikes, DG_angles, analyze_core_only=True)
+        # # Estimate tuning parameters from the model neurons
         metrics_analysis = ModelMetricsAnalysis(v1_spikes, DG_angles, self.network, data_dir=self.flags.data_dir,
                                                 drifting_gratings_init=self.pre_delay, drifting_gratings_end=self.pre_delay+self.flags.evoked_duration,
                                                 spontaneous_init=0, spontaneous_end=self.pre_delay,
@@ -1060,6 +1077,7 @@ class Callbacks:
                 save_optimizer=True, spontaneous_training=False):
         
         self.n_neurons = flags.neurons
+        self.n_edges = network['n_edges'] + len(lgn_input['weights'])
         self.network = network
         self.lgn_input = lgn_input
         self.bkg_input = bkg_input
@@ -1078,6 +1096,7 @@ class Callbacks:
         self.step = 0
         self.step_running_time = []
         self.step_memory_usage = []  # Track GPU memory usage per step
+        self.step_rate = []  # Track step rate
         self.model_variables_dict = model_variables_init
         self.initial_metric_values = None
         self.summary_writer = tf.summary.create_file_writer(self.logdir)
@@ -1129,7 +1148,7 @@ class Callbacks:
         )
         # Manager for osi/dsi checkpoints 
         self.epoch_manager = tf.train.CheckpointManager(
-            checkpoint, directory=self.logdir + '/Intermediate_checkpoints', max_to_keep=5
+            checkpoint, directory=self.logdir + '/Intermediate_checkpoints', max_to_keep=3
         )
 
     def on_train_begin(self):
@@ -1183,10 +1202,14 @@ class Callbacks:
         else:
             mean_gpu_memory = 0.0
             sem_gpu_memory = 0.0
+
+        # Calcualte the mean and sem rate
+        mean_rate = np.mean(self.step_rate)
+        sem_rate = np.std(self.step_rate) / np.sqrt(len(self.step_rate))
         
         # Create a directory for saving statistics if it doesn't exist
         stats_dir = os.path.dirname(os.path.dirname(self.logdir))  # Go up to Simulation_results
-        stats_file = os.path.join(stats_dir, 'training_statistics.csv')
+        stats_file = os.path.join(stats_dir, 'performance_statistics.csv')
         
         # Check if file exists to determine if we need to write headers
         file_exists = os.path.isfile(stats_file)
@@ -1195,11 +1218,11 @@ class Callbacks:
         with open(stats_file, 'a') as f:
             if not file_exists:
                 # Write header if file doesn't exist
-                f.write('sim_name,n_neurons,batch_size,seq_len,mean_step_time,sem_step_time,mean_gpu_memory,sem_gpu_memory,mode\n')
+                f.write('sim_name,n_neurons,n_edges,batch_size,seq_len,mean_rate,sem_rate,mean_step_time,sem_step_time,mean_gpu_memory,sem_gpu_memory,mode\n')
             
             # Write data row
-            f.write(f'{sim_name},{self.n_neurons},{self.flags.batch_size},{self.flags.seq_len},'
-                   f'{mean_step_time:.4f},{sem_step_time:.4f},{mean_gpu_memory:.4f},{sem_gpu_memory:.4f},"train"\n')
+            f.write(f'{sim_name},{self.n_neurons},{self.n_edges},{self.flags.batch_size},{2*self.flags.seq_len},'
+                   f'{mean_rate:.4f},{sem_rate:.4f},{mean_step_time:.4f},{sem_step_time:.4f},{mean_gpu_memory:.4f},{sem_gpu_memory:.4f},"train"\n')
             
         print(f"\nTraining statistics saved to {stats_file}")
 
@@ -1312,6 +1335,7 @@ class Callbacks:
 
     def on_step_end(self, train_values, y, verbose=True):
         self.step_running_time.append(time() - self.step_init_time)
+        self.step_rate.append(train_values[1])
         
         # Capture GPU memory usage using the get_gpu_memory function
         # Only retrieve nvidia-smi GPU memory usage
@@ -1349,19 +1373,26 @@ class Callbacks:
         except:
             print("Saving failed. Maybe next time?")
 
-    def plot_losses_curves(self):        
+    def plot_losses_curves(self):
         # Define labels and components
-        labels = ['val_loss', 'val_rate_loss', 'val_voltage_loss', 'val_regularizer_loss', 'val_osi_dsi_loss', 'val_sync_loss']
-        component_labels = [l for l in labels if l != 'val_loss']
-        
+        labels = [
+            "val_loss",
+            "val_rate_loss",
+            "val_voltage_loss",
+            "val_regularizer_loss",
+            "val_osi_dsi_loss",
+            "val_sync_loss",
+        ]
+        component_labels = [l for l in labels if l != "val_loss"]
+
         # Create descriptive names for the labels
         label_display_names = {
-            'val_rate_loss': 'Rate Loss',
-            'val_voltage_loss': 'Voltage Reg.',
-            'val_regularizer_loss': 'Weight Reg.',
-            'val_osi_dsi_loss': 'OSI/DSI Loss',
-            'val_sync_loss': 'Sync. Loss',
-            'val_loss': 'Total Loss'
+            "val_rate_loss": "Rate Loss",
+            "val_voltage_loss": "Voltage Reg.",
+            "val_regularizer_loss": "Weight Reg.",
+            "val_osi_dsi_loss": "OSI/DSI Loss",
+            "val_sync_loss": "Sync. Loss",
+            "val_loss": "Total Loss",
         }
         
         # Create directory for loss curves
@@ -1371,7 +1402,7 @@ class Callbacks:
         # Normalize loss components
         normalized_data = {}
         for label in labels:
-            if label != 'val_loss' and label in self.epoch_metric_values:
+            if label in self.epoch_metric_values:
                 values = np.array(self.epoch_metric_values[label])
                 if len(values) > 0 and values[0] != 0:  # Avoid division by zero
                     normalized_data[label] = values / values[0]
@@ -1381,130 +1412,121 @@ class Callbacks:
         
         # Create epoch indices
         epochs = np.arange(1, len(next(iter(normalized_data.values()))) + 1)
-                
-        # Create figure with side-by-side layout
-        fig = plt.figure(figsize=(14, 5))
-        gs = GridSpec(1, 2, width_ratios=[1, 1], wspace=0.2)
-        
-        # Use a professional color palette (colorblind-friendly)
-        colors = plt.cm.viridis(np.linspace(0, 0.85, len(component_labels)))
-        
-        # --- SUBPLOT A: NORMALIZED LOSS COMPONENTS ---
-        ax1 = fig.add_subplot(gs[0])
-        
-        # Plot normalized loss components
-        for i, label in enumerate([l for l in component_labels if l in normalized_data]):
+
+        # Create figure with vertical layout (shared x-axis)
+        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 8))
+        plt.subplots_adjust(hspace=0.08)
+
+        # Use a professional colorblind-friendly palette
+        colors = {
+            "val_rate_loss": "#0077BB",  # Blue
+            "val_voltage_loss": "#33BBEE",  # Cyan
+            "val_regularizer_loss": "#009988",  # Teal
+            "val_osi_dsi_loss": "#EE7733",  # Orange
+            "val_sync_loss": "#CC3311",  # Red
+        }
+
+        # --- TOP SUBPLOT: STACKED AREA CHART ---
+        valid_component_labels = [
+            l for l in component_labels if l in self.epoch_metric_values
+        ]
+        data = np.array(
+            [self.epoch_metric_values[label] for label in valid_component_labels]
+        )
+        stack_colors = [colors[l] for l in valid_component_labels]
+
+        ax1.stackplot(
+            epochs,
+            data,
+            labels=[label_display_names[lbl] for lbl in valid_component_labels],
+            colors=stack_colors,
+            alpha=1,
+            edgecolor="white",
+            linewidth=0.5,
+        )
+
+        # Total loss line (thicker, more prominent)
+        if "val_loss" in self.epoch_metric_values:
+            ax1.plot(
+                epochs,
+                self.epoch_metric_values["val_loss"],
+                color="#000000",
+                linewidth=3,
+                linestyle="-",
+                label=label_display_names["val_loss"],
+                zorder=10,
+            )
+
+        ax1.set_ylabel("Absolute Loss", fontsize=26)
+        ax1.set_xlabel("Training Epoch", fontsize=26)
+        ax1.grid(True, linestyle="-", alpha=0.2, color="gray")
+        ax1.set_axisbelow(True)
+        ax1.yaxis.set_major_formatter(ticker.FormatStrFormatter("%.1f"))
+
+        max_y = np.sum(data, axis=0).max() * 1.05 if data.size > 0 else 1
+        ax1.set_ylim(0, min(max_y, 5))
+        ax1.set_xlim(0, 75)
+        ax1.set_xticks([0, 25, 50, 75])
+
+        ax1.tick_params(axis="both", which="major", labelsize=18)
+        ax1.spines["top"].set_visible(False)
+        ax1.spines["right"].set_visible(False)
+
+        # Legend for total loss only on top subplot
+        ax1.legend(
+            loc="upper right",
+            frameon=True,
+            fancybox=False,
+            edgecolor="gray",
+            fontsize=18,
+            ncol=1,
+        )
+
+        # --- BOTTOM SUBPLOT: NORMALIZED LOSS COMPONENTS ---
+        # Plot normalized loss components (thinner, more transparent)
+        for label in [l for l in component_labels if l in normalized_data]:
             display_name = label_display_names.get(label, label)
-            ax1.plot(epochs, normalized_data[label], label=display_name, color=colors[i], linewidth=2.5, alpha=0.8)
-        
-        # Configure first subplot
-        ax1.set_xlabel('Training Epoch', fontweight='bold', fontsize=16)
-        ax1.set_ylabel('Relative Loss (w.r.t. Initial Value)', fontweight='bold', fontsize=16)
-        ax1.set_yscale('log')
-        ax1.grid(True, linestyle='--', alpha=0.3, which='both')
-        ax1.set_axisbelow(True)  # Place grid behind data
-        
-        # Add minor grid lines for log scale
-        ax1.grid(which='minor', linestyle=':', alpha=0.2)
-        
-        # Create legend with columns
-        ax1.legend(loc='upper center', bbox_to_anchor=(0.5, 1.15), 
-                ncol=3, frameon=True, fancybox=True, shadow=True, fontsize=13)
-        
-        # Add panel label
-        ax1.text(-0.12, 1.05, 'A', transform=ax1.transAxes, 
-                fontsize=20, fontweight='bold', va='bottom')
-        
-        # Increase tick label size
-        ax1.tick_params(axis='both', which='major', labelsize=14)
-        
-        # --- SUBPLOT B: STACKED AREA CHART ---
-        ax2 = fig.add_subplot(gs[1])
-        
-        # Get data for stacked area plot
-        valid_component_labels = [l for l in component_labels if l in self.epoch_metric_values]
-        data = np.array([self.epoch_metric_values[label] for label in valid_component_labels])
-        
-        # Create stacked area plot
-        areas = ax2.stackplot(epochs, data, labels=[label_display_names[lbl] for lbl in valid_component_labels], 
-                            colors=colors[:len(valid_component_labels)], alpha=0.8, edgecolor='white', linewidth=0.3)
-        
-        # Add total loss line
-        if 'val_loss' in self.epoch_metric_values:
-            ax2.plot(epochs, self.epoch_metric_values['val_loss'], 
-                    color='black', linewidth=3, linestyle='-', 
-                    label=label_display_names['val_loss'])
-        
-        # Configure second subplot
-        ax2.set_xlabel('Training Epoch', fontweight='bold', fontsize=16)
-        ax2.set_ylabel('Loss Components', fontweight='bold', fontsize=16)
-        ax2.grid(True, linestyle='--', alpha=0.3)
+            ax2.plot(
+                epochs,
+                normalized_data[label],
+                label=display_name,
+                color=colors[label],
+                linestyle="--",
+                linewidth=1.5,
+                alpha=1,
+            )
+
+        # Plot normalized total loss (thicker, more prominent)
+        if "val_loss" in normalized_data:
+            ax2.plot(
+                epochs,
+                normalized_data["val_loss"],
+                label=label_display_names["val_loss"],
+                color="#000000",
+                linewidth=3,
+                linestyle="-",
+                zorder=10,
+            )
+
+        # Configure bottom subplot
+        ax2.set_xlabel("Training Epoch", fontsize=26)
+        ax2.set_ylabel("Relative Loss", fontsize=26)
+        ax2.set_yscale("log")
+        ax2.set_xlim(0, 75)
+        ax2.set_xticks([0, 25, 50, 75])
+        ax2.grid(True, linestyle="-", alpha=0.2, which="major", color="gray")
+        ax2.grid(which="minor", linestyle=":", alpha=0.1, color="gray")
         ax2.set_axisbelow(True)
-        
-        # Format y-axis tick labels to be more readable
-        ax2.yaxis.set_major_formatter(ticker.FormatStrFormatter('%.2f'))
-        
-        # Set upper limit based on data
-        max_y = np.sum(data, axis=0).max() * 1.1 if data.size > 0 else 1
-        ylimit = min(max_y, 5)  # Adjust as needed, capped at 5
-        ax2.set_ylim(0, ylimit)
-        
-        # More elegant break symbol if needed
-        if max_y > ylimit:
-            break_size = 0.015
-            kwargs = dict(transform=ax2.transAxes, color='black', clip_on=False, linewidth=1.5)
-            ax2.plot((-break_size, +break_size), (1 - break_size, 1 + break_size), **kwargs)
-            ax2.plot((-break_size, +break_size), (1 - 2*break_size, 1), **kwargs)
-            ax2.plot((1 - break_size, 1 + break_size), (1 - break_size, 1 + break_size), **kwargs)
-            ax2.plot((1 - break_size, 1 + break_size), (1 - 2*break_size, 1), **kwargs)
-        
-        # Increase tick label size
-        ax2.tick_params(axis='both', which='major', labelsize=14)
-        
-        # Add annotations for important components in the stack
-        if epochs.size > 0:  # Check if we have epochs to plot
-            middle_epoch = len(epochs) // 2
-            for i, (label, area) in enumerate(zip(valid_component_labels, areas)):
-                # Find y-coordinate in the middle of each area at the middle epoch
-                if i == 0:
-                    y_pos = data[i][middle_epoch] / 2
-                else:
-                    y_pos = sum(data[:i, middle_epoch]) + data[i][middle_epoch] / 2
-                
-                # Only label areas that are visually significant
-                if max(data[i]) > 0.1: #* ylimit:  # Threshold for labeling
-                    # Add a white background to ensure text visibility
-                    bbox_props = dict(
-                        boxstyle="round,pad=0.3", 
-                        fc="white", 
-                        ec="none", 
-                        alpha=0.6
-                    )
-                    
-                    # Create annotation with high z-order and background
-                    ax2.annotate(
-                        label_display_names[label].split()[0],  # Use first word only
-                        xy=(middle_epoch, y_pos),
-                        ha='center', va='center',
-                        color='black',  # Use black for contrast against white background
-                        fontweight='bold', fontsize=14,  # Increased from 12 to 14
-                        bbox=bbox_props,  # Add white background
-                        zorder=1000  # Very high z-order to ensure it's on top
-                    )
-        
-        # Add panel label
-        ax2.text(-0.12, 1.05, 'B', transform=ax2.transAxes, 
-                fontsize=20, fontweight='bold', va='bottom')
-        
-        # Legend for total loss
-        if 'val_loss' in self.epoch_metric_values:
-            total_loss_legend = ax2.legend([ax2.get_lines()[0]], [label_display_names['val_loss']], 
-                                        loc='upper right', frameon=True, fancybox=True, shadow=True, fontsize=13)
-            ax2.add_artist(total_loss_legend)
-        
-        # Tight layout
-        plt.tight_layout(rect=[0, 0, 1, 0.95])
-        plt.savefig(os.path.join(images_dir, f'losses_curves.png'), dpi=300, transparent=False, bbox_inches='tight')
+
+        ax2.tick_params(axis="both", which="major", labelsize=18)
+        ax2.spines["top"].set_visible(False)
+        ax2.spines["right"].set_visible(False)
+
+        plt.tight_layout()
+        # plt.savefig(os.path.join(images_dir, 'losses_curves.pdf'), dpi=300, bbox_inches='tight')
+        plt.savefig(
+            os.path.join(images_dir, "losses_curves.png"), dpi=300, bbox_inches="tight", transparent=False
+        )
         plt.close()
     
     def plot_raster(self, x, v1_spikes, y):
