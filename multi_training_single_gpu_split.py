@@ -1017,7 +1017,7 @@ def main(_):
     normalizers = {'v1_ema': v1_ema.numpy()}
     callbacks.on_train_end(metric_values, normalizers=normalizers)
 
- 
+
 if __name__ == '__main__':
     hostname = socket.gethostname()
     print("*" * 80)
@@ -1027,8 +1027,8 @@ if __name__ == '__main__':
     # cluster host name to be n??? where ??? is 3 digit number.
     # let's make regex for that.
     if hostname.count('alleninstitute') > 0 or re.search(r'n\d{3}', hostname) is not None:
-        _data_dir = '/allen/programs/mindscope/workgroups/realistic-model/shinya.ito/tensorflow_new/V1_GLIF_model/GLIF_network'
-        _results_dir = '/allen/programs/mindscope/workgroups/realistic-model/shinya.ito/tensorflow_new/V1_GLIF_model/Simulation_results'
+        _data_dir = '/allen/programs/mindscope/workgroups/entrainment/beatriz.herrera/gamma-osc-biorealistic-v1-model/V1_GLIF_model/GLIF_network'
+        _results_dir = '/allen/programs/mindscope/workgroups/entrainment/beatriz.herrera/gamma-osc-biorealistic-v1-model/V1_GLIF_model/Simulation_results'
     else: 
         _data_dir = '/home/jgalvan/Desktop/Neurocoding/V1_GLIF_model/GLIF_network'
         _results_dir = '/home/jgalvan/Desktop/Neurocoding/V1_GLIF_model/Simulation_results'
@@ -1036,7 +1036,7 @@ if __name__ == '__main__':
     absl.app.flags.DEFINE_string('data_dir', _data_dir, '')
     absl.app.flags.DEFINE_string('results_dir', _results_dir, '')
     absl.app.flags.DEFINE_string('task_name', 'drifting_gratings_firing_rates_distr' , '')
-    
+
     # absl.app.flags.DEFINE_string('restore_from', '', '')
     # absl.app.flags.DEFINE_string('restore_from', '../results/multi_training/b_53dw/results/ckpt-49', '')
     absl.app.flags.DEFINE_string('restore_from', '', '')
@@ -1134,4 +1134,3 @@ if __name__ == '__main__':
     absl.app.flags.DEFINE_boolean("debug_gradients", False, "")
 
     absl.app.run(main)
-
