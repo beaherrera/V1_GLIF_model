@@ -114,8 +114,11 @@ def main(_):
         # strategy = tf.distribute.MirroredStrategy(cross_device_ops=tf.distribute.NcclAllReduce())
         # Use HierarchicalCopyAllReduce to avoid NCCL issues with Blackwell GPUs
         strategy = tf.distribute.MirroredStrategy(cross_device_ops=tf.distribute.HierarchicalCopyAllReduce())
+    elif len(physical_devices) == 1:
+        # strategy = tf.distribute.OneDeviceStrategy(device="/gpu:0")
+        strategy = tf.distribute.MirroredStrategy() # using single device gpu increases largely the memory required to allocate the pre_ind_table tensor
     else:
-        strategy = tf.distribute.MirroredStrategy()
+        strategy = tf.distribute.OneDeviceStrategy(device="/cpu:0")
 
     per_replica_batch_size = flags.batch_size
     global_batch_size = per_replica_batch_size * strategy.num_replicas_in_sync
@@ -165,7 +168,8 @@ def main(_):
             hard_reset=flags.hard_reset,
             add_metric=False,
             max_delay=5,
-            current_input=flags.current_input
+            current_input=flags.current_input,
+            use_dummy_state_input=False
         )
         
         # Initialize the weights of the model based on the specified input shape. It operates in eager mode.
@@ -402,14 +406,11 @@ def main(_):
         #     rec_weight_loss = rec_weight_regularizer(rsnn_layer.cell.recurrent_weight_values)
         #     return tf.nn.compute_average_loss(per_example_loss, global_batch_size=global_batch_size) + rec_weight_loss
 
-        # These "dummy" zeros are injected to the models membrane voltage
-        # Provides the opportunity to compute gradients wrt. membrane voltages at all time steps
-        # Not important for general use
+        # Initial state used for gray-screen warmup and training.
         zero_state = rsnn_layer.cell.zero_state(per_replica_batch_size, dtype=dtype)
         # state_variables = tf.nest.map_structure(lambda a: tf.Variable(
         #     a, trainable=False, synchronization=tf.VariableSynchronization.ON_READ
         # ), zero_state)
-        dummy_zeros = tf.zeros((per_replica_batch_size, flags.seq_len, network["n_nodes"]), dtype)
 
         # Add other metrics and losses
         train_loss = tf.keras.metrics.Mean()
@@ -448,14 +449,10 @@ def main(_):
                 print("Loaded cached spontaneous LGN firing rates.")
             else:
                 # Compute and cache the spontaneous firing rates
-                spontaneous_lgn_firing_rates = stim_dataset.generate_drifting_grating_tuning(
+                spontaneous_lgn_firing_rates = stim_dataset.generate_gray_screen_stimulus(
                     seq_len=flags.seq_len,
-                    pre_delay=flags.seq_len,
-                    post_delay=0,
                     n_input=flags.n_input,
-                    rotation=flags.rotation,
                     data_dir=flags.data_dir,
-                    billeh_phase=True,
                     return_firing_rates=True,
                     dtype=dtype
                 )
@@ -466,33 +463,38 @@ def main(_):
                 with open(cache_file, "wb") as f:
                     pkl.dump(spontaneous_prob, f)
                 print("Computed and cached spontaneous LGN firing rates.")
-            
-            # repeat the spontaneous firing rates with shape (seqlen, n_input) to match the batch size 
-            spontaneous_prob = tf.tile(tf.expand_dims(spontaneous_prob, axis=0), [per_replica_batch_size, 1, 1])
+            return tf.convert_to_tensor(spontaneous_prob, dtype=dtype)
 
-            return spontaneous_prob
+        # Load the spontaneous probabilities once (seq_len, n_input)
+        spontaneous_prob_base = compute_spontaneous_lgn_firing_rates()
+        spontaneous_prob_base = tf.convert_to_tensor(spontaneous_prob_base, dtype=dtype)
 
-        # Load the spontaneous probabilities once
-        spontaneous_prob = compute_spontaneous_lgn_firing_rates()
-        spontaneous_prob = tf.constant(spontaneous_prob, dtype=dtype)
+        def build_spontaneous_prob(_):
+            base_shape = tf.shape(spontaneous_prob_base)
+            batch_dim = tf.cast(per_replica_batch_size, base_shape.dtype)
+            target_shape = tf.concat([[batch_dim], base_shape], axis=0)
+            return tf.broadcast_to(spontaneous_prob_base, target_shape)
+
+        spontaneous_prob = strategy.experimental_distribute_values_from_function(build_spontaneous_prob)
 
 
     def roll_out(x, y, initial_state, spontaneous=False, trim=True):
 
         # _initial_state = tf.nest.map_structure(lambda _a: _a.read_value(), initial_state)
         seq_len = tf.shape(x)[1]
+        if x.dtype == tf.bool:
+            x = tf.cast(x, dtype)
 
         if flags.gradient_checkpointing:
             @tf.recompute_grad
             def roll_out_with_gradient_checkpointing(x, state_vars):
                 # Call extractor model without storing intermediate state variables
-                # dummy_zeros = tf.zeros((per_replica_batch_size, seq_len, network["n_nodes"]), dtype)
-                _out = extractor_model((x, dummy_zeros, state_vars))
+                _out = extractor_model((x, state_vars))
                 return _out
 
             _out = roll_out_with_gradient_checkpointing(x, initial_state)
         else:
-            _out = extractor_model((x, dummy_zeros, initial_state))
+            _out = extractor_model((x, initial_state))
 
         _z, _v = _out[0]
 
@@ -553,7 +555,7 @@ def main(_):
         ### Forward propagation of the model
         with tf.GradientTape() as tape:
             # _out, _p, _loss, _aux, _ = roll_out(_x, _y, _w, trim=trim, spontaneous=spontaneous)
-            _out, _loss, _aux = roll_out(tf.cast(x, dtype), y, state_variables, trim=trim, spontaneous=spontaneous)
+            _out, _loss, _aux = roll_out(x, y, state_variables, trim=trim, spontaneous=spontaneous)
             # Scale the loss for float16         
             if flags.dtype=='float16':
                 _scaled_loss = optimizer.get_scaled_loss(_loss)
@@ -662,20 +664,33 @@ def main(_):
 
     @tf.function
     def distributed_train_step(x, y, state_variables, spontaneous, trim):
-        _loss, _aux, _out = strategy.run(train_step, args=(x, y, state_variables, spontaneous, trim))
+        _loss, _aux, _ = strategy.run(train_step, args=(x, y, state_variables, spontaneous, trim))
         # _loss, _aux, _out, grad = train_step(x, y, state_variables, spontaneous, trim)
-        return _loss, _aux, _out#, grad
+        return _loss, _aux
 
-    def split_train_step(x, y, state_variables, x_spontaneous, trim=True):
-        # Run the training step for the spontaneous condition
-        _loss_spontaneous, _, _out_spontaneous = distributed_train_step(x_spontaneous, y, state_variables, True, trim)
-        # Run the training step for the non-spontaneous condition
-        _loss_evoked, _, _out_evoked = distributed_train_step(x, y, state_variables, False, trim)
-        # _loss = _loss_evoked + _loss_spontaneous
+    @tf.function
+    def distributed_train_step_with_outputs(x, y, state_variables, spontaneous, trim):
+        _loss, _aux, _out = strategy.run(train_step, args=(x, y, state_variables, spontaneous, trim))
+        return _loss, _aux, _out
 
-        v1_spikes_evoked = strategy.experimental_local_results(_out_evoked)[0][0][0]
-        v1_spikes_spont = strategy.experimental_local_results(_out_spontaneous)[0][0][0]
-        model_spikes = (v1_spikes_evoked, v1_spikes_spont)	
+    def split_train_step(x, y, state_variables, x_spontaneous, trim=True, capture_spikes=False):
+        if capture_spikes:
+            # Run the training step for the spontaneous condition
+            _loss_spontaneous, _, _out_spontaneous = distributed_train_step_with_outputs(
+                x_spontaneous, y, state_variables, True, trim
+            )
+            # Run the training step for the non-spontaneous condition
+            _loss_evoked, _, _out_evoked = distributed_train_step_with_outputs(
+                x, y, state_variables, False, trim
+            )
+
+            v1_spikes_evoked = strategy.experimental_local_results(_out_evoked)[0][0][0]
+            v1_spikes_spont = strategy.experimental_local_results(_out_spontaneous)[0][0][0]
+            model_spikes = (v1_spikes_evoked, v1_spikes_spont)
+        else:
+            distributed_train_step(x_spontaneous, y, state_variables, True, trim)
+            distributed_train_step(x, y, state_variables, False, trim)
+            model_spikes = (None, None)
 
         rate_loss = train_rate_loss.result()
         voltage_loss = train_voltage_loss.result()
@@ -762,13 +777,10 @@ def main(_):
     def get_gray_dataset_fn():
         def _f(input_context):
             batch_size = input_context.get_per_replica_batch_size(global_batch_size)
-            _gray_data_set = (stim_dataset.generate_drifting_grating_tuning(
+            _gray_data_set = (stim_dataset.generate_gray_screen_stimulus(
                 seq_len=flags.seq_len,
-                pre_delay=flags.seq_len,
-                post_delay=0,
                 n_input=flags.n_input,
                 data_dir=flags.data_dir,
-                rotation=flags.rotation,
                 return_firing_rates=True,
                 dtype=dtype
             )
@@ -888,6 +900,7 @@ def main(_):
         it = iter(train_data_set)
 
         # tf.profiler.experimental.start(logdir=logdir)
+        model_spikes = (None, None)
         for step in range(flags.steps_per_epoch):
             callbacks.on_step_start()
             # Start profiler at specified step
@@ -921,7 +934,12 @@ def main(_):
                     #     model_spikes, step_values = distributed_split_train_step(x_chunk, y, gray_state, x_spont_chunk, trim=chunknum==1)
                     # # distributed_train_step(x, y, w, trim=chunknum==1)
                     # model_spikes, step_values = distributed_split_train_step(x, y, gray_state, x_spontaneous, trim=chunknum==1)
-                    model_spikes, step_values = split_train_step(x, y, gray_state, x_spontaneous, trim=True)
+                    capture_spikes = (step == flags.steps_per_epoch - 1)
+                    model_spikes_step, step_values = split_train_step(
+                        x, y, gray_state, x_spontaneous, trim=True, capture_spikes=capture_spikes
+                    )
+                    if capture_spikes:
+                        model_spikes = model_spikes_step
                     # model_spikes, step_values = distributed_split_train_step(x, y, gray_state, x_spontaneous, trim=True)
                     break
                 except tf.errors.ResourceExhaustedError as e:
