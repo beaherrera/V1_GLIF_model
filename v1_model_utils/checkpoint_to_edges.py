@@ -7,8 +7,8 @@ import argparse
 import logging
 
 
-debug = True
-# debug = False
+# debug = True
+debug = False
 
 if debug:
     args = argparse.Namespace(
