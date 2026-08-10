@@ -32,8 +32,9 @@ def sort_indices_tf(indices, *arrays):
     sorted_arrays = [tf.gather(arr, sorted_ind).numpy() for arr in [indices, *arrays]]
     return tuple(sorted_arrays)
 
-def create_network_dat(data_dir='GLIF_network', source='v1', target='v1', 
-                        output_file='GLIF_network/tf_data/network_dat.pkl', save_pkl=True):
+def create_network_dat(data_dir='GLIF_network', source='v1', target='v1',
+                        output_file='GLIF_network/tf_data/network_dat.pkl', save_pkl=True,
+                        synaptic_data_dir='synaptic_data'):
     # Extract the network data into a pickle file from the SONATA files
     new_network_dat = {"nodes": [], "edges": []}
 
@@ -74,7 +75,7 @@ def create_network_dat(data_dir='GLIF_network', source='v1', target='v1',
     edges_type_df = pd.read_csv(os.path.join(data_dir, 'network', edge_types_file), delimiter=" ")
     # synaptic_models_path = os.path.join('GLIF_network', 'components', "synaptic_models")
     synaptic_models_path = os.path.join(data_dir, 'components', "synaptic_models")
-    basis_function_weights_df = pd.read_csv('synaptic_data/basis_function_weights.csv', index_col=0)
+    basis_function_weights_df = pd.read_csv(os.path.join(synaptic_data_dir, 'basis_function_weights.csv'), index_col=0)
     print(f'Saving basis function weights for {source}-{target}')
     # Map the synaptic model to a given id using a dictionary
     # path = os.path.join('GLIF_network', 'synaptic_models_to_syn_id_dict.pkl')
@@ -160,7 +161,8 @@ def load_network(
     connected_selection=True,
     tensorflow_speed_up=False,
     random_weights=False,
-    uniform_weights=False):
+    uniform_weights=False,
+    synaptic_data_dir='synaptic_data'):
 
     rd = np.random.RandomState(seed=seed)
     
@@ -173,7 +175,8 @@ def load_network(
         # data_dir = os.path.join(base_dir, "network")
         print(f"Creating {path} file...")
         d = create_network_dat(data_dir=data_dir, source='v1', target='v1',
-                               output_file=path, save_pkl=True)
+                               output_file=path, save_pkl=True,
+                               synaptic_data_dir=synaptic_data_dir)
         # d = create_network_dat(data_dir='GLIF_network/network', source='v1', target='v1',
         #                         output_file='GLIF_network/network_dat.pkl', save_pkl=True)
     else:
@@ -385,6 +388,7 @@ def load_input(data_dir="GLIF_network",
                bmtk_id_to_tf_id=None,
                n_input=17400,
                tensorflow_speed_up=False,
+               synaptic_data_dir='synaptic_data',
             #    start=0,
             #    duration=3000,
             #    dt=1
@@ -395,7 +399,8 @@ def load_input(data_dir="GLIF_network",
         print(f"Creating {input_dat_path} file...")
         # Process BKG input network
         input_dat = create_network_dat(data_dir=data_dir, source=source, target='v1',
-                                       output_file=input_dat_path, save_pkl=True)
+                                       output_file=input_dat_path, save_pkl=True,
+                                       synaptic_data_dir=synaptic_data_dir)
         print("Done.")
     else:
         with open(input_dat_path, "rb") as f:
@@ -690,8 +695,12 @@ def reduce_input_population(input_population, new_n_input, seed=3000):
   
 # @profile
 def load_v1(flags, n_neurons, flag_str=''):
-    # Initialize the network 
+    # Initialize the network
     t0 = time()
+    # Directory holding the TF-training synaptic properties (tau_basis.npy,
+    # basis_function_weights.csv). Defaults to 'synaptic_data' for entry points
+    # that don't define the flag.
+    synaptic_data_dir = getattr(flags, 'synaptic_data_dir', 'synaptic_data')
     network = load_network(
                         # path=os.path.join(flags.data_dir, "tf_data", "network_dat.pkl"),
                         # h5_path=os.path.join(flags.data_dir, "network", "v1_nodes.h5"),
@@ -702,7 +711,8 @@ def load_v1(flags, n_neurons, flag_str=''):
                         connected_selection=flags.connected_selection,
                         tensorflow_speed_up=False,
                         random_weights=flags.random_weights,
-                        uniform_weights=flags.uniform_weights
+                        uniform_weights=flags.uniform_weights,
+                        synaptic_data_dir=synaptic_data_dir
     )
     print('Load_network: %.2f seconds' % (time() - t0))
 
@@ -749,7 +759,8 @@ def load_v1(flags, n_neurons, flag_str=''):
                             input_dat_path=lgn_path,
                             bmtk_id_to_tf_id=network['bmtk_id_to_tf_id'],
                             n_input=flags.n_input,
-                            tensorflow_speed_up=False)
+                            tensorflow_speed_up=False,
+                            synaptic_data_dir=synaptic_data_dir)
     if flags.n_input != 17400:
         lgn_input = reduce_input_population(lgn_input, flags.n_input, seed=flags.seed)
     
@@ -765,7 +776,8 @@ def load_v1(flags, n_neurons, flag_str=''):
                             input_dat_path=bkg_path,
                             bmtk_id_to_tf_id=network['bmtk_id_to_tf_id'],
                             n_input=n_bkg_input,
-                            tensorflow_speed_up=False)
+                            tensorflow_speed_up=False,
+                            synaptic_data_dir=synaptic_data_dir)
 
     return network, lgn_input, bkg_input
 

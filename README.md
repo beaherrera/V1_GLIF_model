@@ -105,6 +105,27 @@ Parameters:
 - `--osi_cost`: Cost weight for matching orientation/direction selectivity to experimental data
 - `--train_recurrent`: Enable training of recurrent connections
 - `--train_noise`: Enable training of noise input scaling
+- `--synaptic_data_dir`: Folder holding the synaptic basis data (`tau_basis.npy`,
+  `basis_function_weights.csv`); default `synaptic_data`
+
+#### Training multiple model variants
+
+Different model variants can have different synaptic properties, so each variant
+needs its own synaptic basis data. Keep them in separate folders and select one
+per run with `--synaptic_data_dir` (analogous to `--data_dir` / `--results_dir`):
+
+```bash
+python parallel_training_testing_allen_vscode.py ... \
+    --data_dir 'GLIF_network_L4-Sst2e-as-L6' \
+    --synaptic_data_dir 'synaptic_data_L4-Sst2e-as-L6'
+```
+
+Create each `synaptic_data_<variant>/` folder yourself by copying `tau_basis.npy`
+and `basis_function_weights.csv` from the network pipeline's `tf_props_<variant>/`
+output (produced by `snakemake --config model_variant=<variant> tf_props_<variant>/basis_function_weights.csv`).
+These folders are created and specified manually — they are intentionally not
+symlinked to the pipeline's output. The default `synaptic_data/` keeps the
+original behavior when the flag is omitted.
 
 #### Evaluating Orientation and Direction Selectivity
 

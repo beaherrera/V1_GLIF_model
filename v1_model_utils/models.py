@@ -330,7 +330,8 @@ class V1Column(tf.keras.layers.Layer):
         train_input=False,
         train_noise=True,
         hard_reset=False,
-        current_input=False
+        current_input=False,
+        synaptic_data_dir='synaptic_data'
     ):
         super().__init__()
         _params = dict(network["node_params"])
@@ -360,7 +361,7 @@ class V1Column(tf.keras.layers.Layer):
         current_factor = 1 / _params["C_m"] * (1 - membrane_decay) * tau
 
         # Determine the synaptic dynamic parameters for each of the 5 basis receptors.
-        path='synaptic_data/tau_basis.npy' # [0.7579732  1.33243834 2.34228851 4.11750046 7.23813909]
+        path=os.path.join(synaptic_data_dir, 'tau_basis.npy') # [0.7579732  1.33243834 2.34228851 4.11750046 7.23813909]
         tau_syns = np.load(path)
         self._n_syn_basis = tau_syns.size
         syn_decay = np.exp(-dt / tau_syns)
@@ -866,7 +867,8 @@ def create_model(
     pseudo_gauss=False,
     hard_reset=False,
     current_input=False,
-    use_dummy_state_input=False
+    use_dummy_state_input=False,
+    synaptic_data_dir='synaptic_data'
 ):
 
     # Create the input layer of the model
@@ -910,7 +912,8 @@ def create_model(
         train_input=train_input,
         train_noise=train_noise,
         hard_reset=hard_reset,
-        current_input=current_input
+        current_input=current_input,
+        synaptic_data_dir=synaptic_data_dir
     )
 
     # initialize the RNN state to zero using the zero_state() method of the V1Column class.

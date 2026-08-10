@@ -15,6 +15,9 @@ parser = argparse.ArgumentParser()
 parser.add_argument('--task_name', default='drifting_gratings_firing_rates_distr', type=str)
 parser.add_argument('--data_dir', default='GLIF_network', type=str)
 parser.add_argument('--results_dir', default='Simulation_results', type=str)
+parser.add_argument('--synaptic_data_dir', default='synaptic_data', type=str,
+                    help='Directory with tau_basis.npy and basis_function_weights.csv; '
+                         'use synaptic_data_<variant> for a model variant')
 parser.add_argument('--restore_from', default='', type=str)
 parser.add_argument('--comment', default='', type=str)
 parser.add_argument('--delays', default='100,0', type=str)

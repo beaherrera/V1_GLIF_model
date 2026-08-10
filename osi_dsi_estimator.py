@@ -172,9 +172,10 @@ def main(_):
             return_state=True,
             hard_reset=flags.hard_reset,
             add_metric=False,
-            max_delay=5, 
+            max_delay=5,
             current_input=flags.current_input,
-            use_dummy_state_input=False
+            use_dummy_state_input=False,
+            synaptic_data_dir=flags.synaptic_data_dir
             )
 
         # del lgn_input, bkg_input
@@ -474,6 +475,7 @@ if __name__ == '__main__':
     absl.app.flags.DEFINE_string('task_name', 'drifting_gratings_firing_rates_distr' , '')
     absl.app.flags.DEFINE_string('data_dir', _data_dir, '')
     absl.app.flags.DEFINE_string('results_dir', _results_dir, '')
+    absl.app.flags.DEFINE_string('synaptic_data_dir', 'synaptic_data', 'Directory with tau_basis.npy and basis_function_weights.csv (use synaptic_data_<variant> for a model variant)')
     absl.app.flags.DEFINE_string('restore_from', 'Intermediate_checkpoints', '')
     absl.app.flags.DEFINE_string('comment', '', '')
     absl.app.flags.DEFINE_string('delays', '100,0', '')
