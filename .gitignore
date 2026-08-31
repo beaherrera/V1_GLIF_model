@@ -7,7 +7,8 @@ pruebas.ipynb
 v1_model_utils/__pycache__
 v1_model_utils/.cache
 general_utils/__pycache__
-Simulation_results
+Simulation_results/
+Simulation_results_*/
 Error
 Out
 # requirements.txt
